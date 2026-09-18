@@ -1,0 +1,20 @@
+# --- generated / local-only (never commit) ---
+server/venv/
+downloader/venv/
+state/
+teases/
+__pycache__/
+*.pyc
+
+# inbox: keep the placeholder README, ignore everything else
+downloader/incoming/*
+!downloader/incoming/README.txt
+
+# --- third-party files (fetched by each user, not distributed here) ---
+# see README.md -> "How to DIY (assembling the player files)"
+player/player.html
+player/acorn-safe.min.js
+player/interpreter.min.js
+player/eos.load.css
+player/eos_throbber.gif
+player/assets/

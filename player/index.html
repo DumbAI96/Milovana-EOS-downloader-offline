@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="user-scalable=0, initial-scale=1, minimum-scale=1, width=device-width, height=device-height">
+<title>Offline tease player</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #000; }
+  iframe.eosIframe { display: block; width: 100%; height: 100%; border: 0; }
+  .noplay { color: #999; font-family: sans-serif; padding: 40px; }
+</style>
+</head>
+<body>
+<script>
+  (function () {
+    var q = new URLSearchParams(location.search);
+    var tease = (q.get("tease") || "").replace(/\/+$/, "");
+    if (!tease) {
+      document.body.innerHTML = '<div class="noplay">No tease selected.<br>Open the player from the landing page (http://localhost:8123/).</div>';
+      return;
+    }
+    var src = "player.html?host&version=1&data=" + encodeURIComponent(tease);
+    ["start", "debug"].forEach(function (k) {
+      if (q.has(k)) src += "&" + k + "=" + encodeURIComponent(q.get(k));
+    });
+    var f = document.createElement("iframe");
+    f.className = "eosIframe";
+    f.src = src;
+    document.body.appendChild(f);
+  })();
+</script>
+<script src="host-local.js"></script>
+</body>
+</html>

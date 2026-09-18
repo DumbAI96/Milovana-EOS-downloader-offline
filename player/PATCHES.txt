@@ -1,0 +1,67 @@
+GLOBAL patches applied to the official player files in this folder.
+(Pristine originals: fetch them from eosscript.com - see the README's "How to DIY" section.)
+These files are shared by ALL teases. Patch once - applies everywhere.
+Re-apply this whole set whenever the player build is updated.
+
+1. assets/index-6f90e65e.js  (patches a-f)
+   a) media URL templates rewritten to use a runtime variable:
+        "https://media.milovana.com/timg/..."  ->  "${window.__EOS_MEDIA_BASE__||""}/timg/..."
+      (2 occurrences; covers tb_<size> thumbnail URLs and original-file URLs)
+      player.html sets __EOS_MEDIA_BASE__ from the "data" query parameter
+      (the relative path to the tease folder), so media comes from the tease's
+      own timg/ folder instead of media.milovana.com.
+   b) runtime chunk-path helper  VC=function(e){return"/"+e}  ->  VC=function(e){return e}
+      so dynamically injected chunk/css links stay document-relative (works from
+      any folder depth, any server root).
+   c) engine instance exposed for the extras layer:
+        "Qg.load();"  ->  "window.__EOS_HOST__=Qg;Qg.load();"
+   d) "NoDelay" flag gates (engine-level, all teases, default off - flag is set by
+      the top-bar toggle in extras.js):
+        say mode           h=!t.mode||t.mode==="auto"?TC(d.peekNextAction()):t.mode
+                       ->  h=window.__EOSX_NO_DELAY__?"pause":(!t.mode||t.mode==="auto"?TC(d.peekNextAction()):t.mode)
+                          => with flag ON, EVERY say renders as a normal "pause" bubble:
+                             waits for continue, shows the arrow, schedules no delay.
+        continue guard     (!d.current||s||a)&&g()
+                       ->  (!d.current||s||a||window.__EOSX_NO_DELAY__)&&g()
+                          => lets you skip a delayed bubble that was already on screen
+                             when the toggle was flipped; harmless otherwise.
+      Effect ON: all lines click-through (Auto advances them at N s). Effect OFF: original.
+   e) Timer skip flags (engine-level, all teases, default off - set by the top-bar
+      "Timers" buttons in extras.js). Inserted into the timer activity component,
+      checked on EVERY frame (live - also skips a wait already in progress):
+        after "if(o)return null;if(s>=t)return l(),null;" insert:
+        "if(window.__EOSX_SKIP_TIMER_NOW__||window.__EOSX_SKIP_ALL_TIMERS__||(window.__EOSX_SKIP_HIDDEN_TIMERS__&&n==="hidden")){window.__EOSX_SKIP_TIMER_NOW__=false;return l(),null;}"
+      (n = the timer's style prop. NOW is one-shot and is consumed on use.)
+
+   f) "Timer multiplier" duration wrap (engine-level, all teases; value set by the
+      top-bar "x" field in the Timers group; 1 = no-op):
+        anchor:   duration:a.milliseconds(),style:t.style,onComplete:
+        becomes:  duration:a.milliseconds()*(window.__EOSX_TIMER_MULT__||1),style:t.style,onComplete:
+      => the classic timer (blocking AND isAsync) is created with its duration scaled:
+         value x duration (0.5 = half length/faster, 2 = double/slower). Takes effect
+         when a timer STARTS (a wait already running keeps its pace). The skip flags
+         from (e) are checked per-frame and still override (skip wins).
+
+2. player.html
+   a) root-absolute "/assets/..." refs -> relative "assets/..."
+   b) adds a tiny inline script that reads ?data=<tease path> and sets
+      window.__EOS_MEDIA_BASE__ before the player bundle runs.
+   c) loads "extras.js" (our feature layer) as a module after the app bundle.
+
+3. assets/index-47f9131c.css (9 refs), assets/index-ec19f3f1.css (6 refs)
+   - url(/assets/...) -> url(...) (same-folder relative).
+
+4. Timer-multiplier duration wrap in two module chunks (same feature as 1f; added so
+   ALL timer kinds obey the multiplier - classic, async, NyX and notification timers):
+   - assets/index-86640c88.js (nyx chunk):
+       duration:a.milliseconds(),style:r.style,onComplete:
+     -> duration:a.milliseconds()*(window.__EOSX_TIMER_MULT__||1),style:r.style,onComplete:
+       (nyx.timer; the chunk imports the timer component from the main bundle)
+   - assets/index-0391222d.js (notification chunk):
+       {className:l.timer,onComplete:n,duration:e}
+     -> {className:l.timer,onComplete:n,duration:e*(window.__EOSX_TIMER_MULT__||1)}
+       (notification.create's timerDuration auto-timer)
+
+NOT A PATCH: extras.js is OUR OWN file (not part of the official player). It holds
+the offline feature layer (auto-advance, more to come) - see README for the list.
+Everything else in the official files: unmodified.
