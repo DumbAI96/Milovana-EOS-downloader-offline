@@ -1321,21 +1321,6 @@ def db_stub(db, tid, assumed=None):
     return e
 
 
-def db_want_ids(db):
-    """Wanted ids with a known title+author and still no data (no script, no
-    simple pages). Stubs without keys are rejected at creation time."""
-    ids = []
-    for tid, e in db["teases"].items():
-        if not e.get("wanted"):
-            continue
-        if e.get("has_script") or e.get("pages"):
-            continue
-        if not _has_keys(e):
-            continue
-        ids.append(tid)
-    return ids
-
-
 def _fmt_numbers(nums):
     """[1,2,3,7,8] -> '1-3, 7-8'"""
     nums = sorted(nums)
@@ -1522,6 +1507,7 @@ def write_tease_from_script(db, tid, script):
     e = db_entry(db, tid)
     e["has_script"] = True
     e["type"] = "player"
+    e["wanted"] = False          # banked = fulfilled: out of the S queue
     return folder, None
 
 
@@ -1650,6 +1636,12 @@ def handle_simple(db, rec):
         _label(db, tid), rec["page"], _fmt_numbers(res["pages"]),
         (" + END(%d)" % res["end"]) if res["end"] else "",
         ("  \u2014 %s" % "; ".join(extra)) if extra else ""))
+    if res["end"] is not None and e.get("wanted"):
+        if not res["missing"]:
+            e["wanted"] = False
+            out('  COMPLETE: %s - removed from the queue.' % _label(db, tid))
+        else:
+            out("    (END reached, but pages are missing - stays in the queue)")
 
 
 def handle_player(db, tid, page_title="", page_author=""):
@@ -1814,23 +1806,208 @@ def _s_left(db, ids):
     return n
 
 
+def _simple_status(e):
+    """(stored page numbers, END page no. or None, missing pages before it) of a
+    static entry. Complete == END page stored AND no gaps before it."""
+    pages = e.get("pages") or {}
+    nums = sorted(int(n) for n in pages)
+    ends = [n for n in nums if pages[str(n)].get("end")]
+    end = max(ends) if ends else None
+    missing = [n for n in range(1, end) if str(n) not in pages] if end else []
+    return nums, end, missing
+
+
+def _s_refresh(db):
+    """S-start check: dequeue everything already fulfilled - interactive with a
+    banked script, static teases that are complete. Returns (n_script, n_simple)."""
+    ns = nst = 0
+    for e in db["teases"].values():
+        if not e.get("wanted"):
+            continue
+        if e.get("has_script"):
+            e["wanted"] = False
+            ns += 1
+        elif e.get("pages"):
+            _n, end, missing = _simple_status(e)
+            if end is not None and not missing:
+                e["wanted"] = False
+                nst += 1
+    return ns, nst
+
+
+def _s_inter_ids(db):
+    """Pending interactive stubs: wanted, keys known, nothing banked yet."""
+    ids = []
+    for tid, e in db["teases"].items():
+        if not e.get("wanted") or e.get("has_script") or e.get("pages"):
+            continue
+        if not _has_keys(e) or e.get("type") == "static":
+            continue
+        ids.append(tid)
+    return sorted(ids, key=int)
+
+
+def _s_simple_ids(db):
+    """Pending static teases: wanted and NOT complete - partial ones stay!"""
+    ids = []
+    for tid, e in db["teases"].items():
+        if not e.get("wanted") or e.get("has_script") or not _has_keys(e):
+            continue
+        if e.get("type") != "static":
+            continue
+        _n, end, missing = _simple_status(e)
+        if end is not None and not missing:
+            continue
+        ids.append(tid)
+    return sorted(ids, key=int)
+
+
+def _s_state(e):
+    """'no pages yet' / 'pages 1-7 (no END yet)' / 'pages 1-7 + END(23), missing 8-22'."""
+    nums, end, missing = _simple_status(e)
+    if not nums:
+        return "no pages yet"
+    if end is None:
+        return "pages %s (no END yet)" % _fmt_numbers(nums)
+    done = [n for n in nums if n != end]
+    if missing:
+        return "pages %s + END(%d), missing %s" % (
+            _fmt_numbers(done) if done else "only", end, _fmt_numbers(missing))
+    return "complete"
+
+
+def _s_txt(s, n):
+    s = str(s or "")
+    return s if len(s) <= n else s[:max(1, n - 1)] + "\u2026"
+
+
+def _s_waitline(db):
+    """Wait for a typed line (Enter included) while absorbing clipboard
+    payloads. Returns the stripped lowercase word; '' = bare Enter."""
+    buf = ""
+    if msvcrt is not None:
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    seq = _clipboard_seq()
+    use_seq = seq != 0
+    last = None if use_seq else clipboard_text()
+    while True:
+        time.sleep(0.25)
+        if msvcrt is not None:
+            while msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    word = buf.strip().lower()
+                    print()
+                    return word
+                if ch in ("\x00", "\xe0"):
+                    if msvcrt.kbhit():
+                        msvcrt.getwch()
+                    continue
+                if ch == "\b":
+                    if buf:
+                        buf = buf[:-1]
+                        print("\b \b", end="", flush=True)
+                    continue
+                if ch == "\x03":
+                    raise KeyboardInterrupt
+                if ch.isprintable():
+                    buf += ch
+                    print(ch, end="", flush=True)
+        changed = False
+        if use_seq:
+            s2 = _clipboard_seq()
+            if s2 != seq:
+                seq = s2
+                changed = True
+        else:
+            t = clipboard_text()
+            if t is not None and t != last:
+                last = t
+                changed = True
+        if changed:
+            text, html_text, src = read_payload()
+            process_payload(db, text, html_text, src)   # handlers print their own lines
+
+
+def _s_pick(db, word, ids):
+    """List number (1-N) or exact tease id from the CURRENT list -> id, else None."""
+    if word.isdigit() and len(word) <= 3:
+        i = int(word)
+        if 1 <= i <= len(ids):
+            return ids[i - 1]
+        beep()
+        out("  no list number %s (the list has %d rows)." % (word, len(ids)))
+        return None
+    if word.isdigit():
+        if word in ids:
+            return word
+        beep()
+        out("  %s is not a pending simple tease (finished, or not queued)." % word)
+        return None
+    beep()
+    out("  use a list number (1-%d) or a tease id." % len(ids))
+    return None
+
+
 def mode_grab_scripts(db):
-    """S: collect the missing data, driven by each stub's TYPE:
-    - player  -> open the geteosscript link and wait for that JSON copy
-    - static  -> open the tease's first page (a bookmark; copy pages whenever)
-    - unknown -> open the tease page first to LEARN the type (copy it once):
-                 static -> its first page is stored; player -> the JSON opens next.
-    Enter = skip the current id; any copied page/listing is absorbed mid-wait."""
-    ids = db_want_ids(db)
+    """S: the data queue, three modes:
+      1) interactive - sequential script grabber (players + unknown stubs)
+      2) simple      - pick from the list; opens that tease's first page
+      3) prune       - dequeue a tease for good (exact id only, on purpose)
+    Dequeue rules: script banked / static complete / pruned. Every S start runs
+    the check first, so finished teases never walk again."""
+    ns, nst = _s_refresh(db)
+    if ns or nst:
+        db_save(db)
+        out("  S queue check: %d already finished -> dequeued (%d script(s), %d complete simple(s))."
+            % (ns + nst, ns, nst))
+    while True:
+        simple_ids = _s_simple_ids(db)
+        inter_ids = _s_inter_ids(db)
+        if not simple_ids and not inter_ids:
+            out("  S: the queue is empty - nothing is waiting for data.")
+            return
+        out("")
+        out("  S MODE - queue: %d interactive, %d simple" % (len(inter_ids), len(simple_ids)))
+        out("    1) interactive - sequential script grabber (one tab at a time)")
+        out("    2) simple      - pick from the list (opens its first page)")
+        out("    3) prune       - dequeue a tease for good (type its exact id)")
+        out("    Enter = back to the main loop    o/l/r = switch mode")
+        word = _s_waitline(db)
+        if word == "":
+            return
+        if word == "s":
+            continue
+        if word in ("o", "l", "r"):
+            out("  leaving S mode...")
+            run_mode(db, word)
+            return
+        if word == "1":
+            r = _s_interactive(db)
+        elif word == "2":
+            r = _s_simple(db)
+        elif word == "3":
+            r = _s_prune(db)
+        else:
+            beep()
+            out('  (unknown input "%s" - 1 / 2 / 3, Enter = leave S)' % word)
+            r = None
+        if r == "left":
+            return
+
+
+def _s_interactive(db):
+    """Mode 1: sequential script grabber over the pending interactive stubs."""
+    ids = _s_inter_ids(db)
     if not ids:
-        out("  S: nothing to grab - no wanted stubs without data (with title+author known).")
-        return
+        out("  nothing interactive pending.")
+        return None
     out("")
-    out("  S MODE - %d wanted stub(s), one at a time (Enter = skip the current one):" % len(ids))
-    out("    player teases -> geteosscript link opens; copy that JSON (Ctrl+A, Ctrl+C)")
-    out("    unknown       -> the tease page opens first; copy it so I can tell what it is")
+    out("  interactive queue: %d - one tab at a time (Enter = pause this one)" % len(ids))
+    out("    no type known yet -> the tease page opens; copy it so I can tell static from player")
+    out("    player teases      -> geteosscript link opens; copy that JSON (Ctrl+A, Ctrl+C)")
     out("    (player pages are one big iframe: an EMPTY copy of them is normal - the id comes from the address)")
-    out("    static        -> its first page just opens (copy its pages whenever)")
     _OPENED_URLS.clear()
     banked = skipped = 0
     idx = 0
@@ -1840,26 +2017,18 @@ def mode_grab_scripts(db):
         if not e.get("wanted") or e.get("has_script") or e.get("pages") or not _has_keys(e):
             idx += 1
             continue
-        ttype = e.get("type")
-        if ttype == "static":
-            out("")
-            out('  %s is a static tease - opening its first page: showtease.php?id=%s' % (_label(db, tid), tid))
-            open_in_browser(PAGE_URL.format(id=tid))
-            out("    copy its pages whenever you like - each one merges into the tease.")
-            idx += 1
-            continue
-        phase = "json" if ttype == "player" else "learn"
+        phase = "json" if e.get("type") == "player" else "learn"
         if phase == "json":
             out("")
             out('  [%d left] opening geteosscript.php?id=%s  %s' % (_s_left(db, ids), tid, _label(db, tid)))
             open_in_browser(SCRIPT_URL.format(id=tid))
-            out('    waiting for the script - Ctrl+A, Ctrl+C in the tab that just opened. (Enter = skip)')
+            out('    waiting for the script - Ctrl+A, Ctrl+C in the tab that just opened. (Enter = pause)')
         else:
             out("")
             out('  [%d left] %s - no type known yet; opening its tease page: showtease.php?id=%s' %
                 (_s_left(db, ids), _label(db, tid), tid))
             open_in_browser(PAGE_URL.format(id=tid))
-            out('    copy that page (Ctrl+A, Ctrl+C) so I can tell static from player. (Enter = skip)')
+            out('    copy that page (Ctrl+A, Ctrl+C) so I can tell static from player. (Enter = pause)')
         outcome = None
         buf = ""
         if msvcrt is not None:
@@ -1879,12 +2048,12 @@ def mode_grab_scripts(db):
                         if word:
                             print()
                         if not word:
-                            outcome = "skip"
+                            outcome = "pause"
                             break
                         if word in ("o", "l", "r", "s"):
                             outcome = word
                             break
-                        out('  (unknown input "%s" - modes: O, L, R, S; Enter = skip)' % word)
+                        out('  (unknown input "%s" - modes: O, L, R, S; Enter = pause)' % word)
                         beep()
                         continue
                     if ch in ("\x00", "\xe0"):
@@ -1923,7 +2092,7 @@ def mode_grab_scripts(db):
                 except Exception:
                     script = None
                 if script is None:
-                    out("  could not read that JSON - still waiting. (Enter = skip)")
+                    out("  could not read that JSON - still waiting. (Enter = pause)")
                     beep()
                     continue
                 src_id = parsers.tease_id_from_url(src) if src else None
@@ -1937,7 +2106,7 @@ def mode_grab_scripts(db):
                     continue
                 db_save(db)
                 banked += 1
-                out('  banked: %s "%s" - script written (%d pages / %d files)' % (
+                out('  banked + dequeued: %s "%s" - script written (%d pages / %d files)' % (
                     bind, (db["teases"].get(bind, {}) or {}).get("title") or "Unknown",
                     len(script.get("pages") or {}), len(script.get("files") or {})))
                 if bind != tid:
@@ -1954,26 +2123,119 @@ def mode_grab_scripts(db):
                   and info.get("id") == tid and phase == "learn"):
                 out("    it is a player tease! opening its geteosscript link now...")
                 open_in_browser(SCRIPT_URL.format(id=tid))
-                out('    waiting for the script - Ctrl+A, Ctrl+C in the tab that opened. (Enter = skip)')
+                out('    waiting for the script - Ctrl+A, Ctrl+C in the tab that opened. (Enter = pause)')
                 phase = "json"
             elif info:
-                out('    (absorbed - still on %s "%s"; Enter = skip)' % (tid, e.get("title") or "Unknown"))
+                out('    (absorbed - still on %s "%s"; Enter = pause)' % (tid, e.get("title") or "Unknown"))
             else:
-                out('    that was not usable content - still on %s "%s". (Enter = skip)' % (tid, e.get("title") or "Unknown"))
+                out('    that was not usable content - still on %s "%s". (Enter = pause)' % (tid, e.get("title") or "Unknown"))
                 beep()
-        if outcome == "skip":
-            out('  skipped: %s "%s"' % (tid, e.get("title") or "Unknown"))
-            beep()
+        if outcome == "pause":
+            out('  paused: %s "%s" (stays in the queue)' % (tid, e.get("title") or "Unknown"))
             skipped += 1
             idx += 1
         elif outcome in ("o", "l", "r", "s"):
+            if outcome == "s":
+                return None
             out("  leaving S mode...")
             run_mode(db, outcome)
-            return
+            return "left"
         elif outcome == "next":
             idx += 1
     out("")
-    out("  S done: %d banked, %d skipped." % (banked, skipped))
+    out("  interactive pass done: %d banked, %d paused." % (banked, skipped))
+    return None
+
+
+def _s_simple(db):
+    """Mode 2: pick from the pending list. Pick = list number or tease id;
+    opens that tease's first page, pages merge live as you copy them."""
+    at_list = True
+    show = True
+    while True:
+        ids = _s_simple_ids(db)
+        if not ids:
+            out("  no simple teases pending.")
+            return None
+        if show:
+            out("")
+            out("  simple teases pending: %d" % len(ids))
+            for i, tid in enumerate(ids, 1):
+                e = db_entry(db, tid)
+                out("   %3d) %-7s %-40s %-18s %s" % (
+                    i, tid, _s_txt(e.get("title"), 40), _s_txt(e.get("author"), 18), _s_state(e)))
+            out("  type a list number or a tease id -> I open its first page (one tab)")
+            out("  Enter = back to the S menu" if at_list else "  Enter = back to the list")
+            out("  o/l/r = switch mode")
+        show = True
+        word = _s_waitline(db)
+        if word == "":
+            if at_list:
+                return None
+            at_list = True
+            continue
+        if word == "s":
+            return None
+        if word in ("o", "l", "r"):
+            out("  leaving S mode...")
+            run_mode(db, word)
+            return "left"
+        tid = _s_pick(db, word, ids)
+        if tid is None:
+            show = False
+            continue
+        out('  opening %s first page: showtease.php?id=%s' % (_label(db, tid), tid))
+        open_in_browser(PAGE_URL.format(id=tid))
+        out("    click Continue through it and copy every page (Ctrl+A, Ctrl+C);")
+        out("    updates merge live - COMPLETE is announced when the END page lands.")
+        at_list = False
+        show = False
+
+
+def _s_prune(db):
+    """Mode 3: dequeue a tease for good - EXACT id only (list numbers are
+    refused on purpose, so nothing leaves the queue on a misread)."""
+    while True:
+        ids_i = _s_inter_ids(db)
+        ids_s = _s_simple_ids(db)
+        ids = sorted(set(ids_i) | set(ids_s), key=int)
+        if not ids:
+            out("  nothing in the queue to prune.")
+            return None
+        out("")
+        out("  queue: %d interactive + %d simple" % (len(ids_i), len(ids_s)))
+        for i, tid in enumerate(ids, 1):
+            e = db_entry(db, tid)
+            out("   %3d) %-7s %-8s %-40s %s" % (
+                i, tid, e.get("type") or "unknown",
+                _s_txt(e.get("title"), 40), _s_txt(e.get("author"), 18)))
+        out("  type the EXACT tease id to prune it (list numbers are refused here - on purpose)")
+        out("  Enter = back to the S menu    o/l/r = switch mode")
+        word = _s_waitline(db)
+        if word == "":
+            return None
+        if word == "s":
+            return None
+        if word in ("o", "l", "r"):
+            out("  leaving S mode...")
+            run_mode(db, word)
+            return "left"
+        if word.isdigit() and len(word) <= 3:
+            beep()
+            out("  refused: type the full tease ID to prune (no list numbers here - on purpose).")
+            continue
+        if word.isdigit():
+            if word in ids:
+                e = db_entry(db, word)
+                e["wanted"] = False
+                db_save(db)
+                out('  pruned: %s - out of the queue (its data is untouched).' % _label(db, word))
+            else:
+                beep()
+                out("  %s is not in the queue - nothing pruned." % word)
+            continue
+        beep()
+        out('  (unknown input "%s" - type a tease ID, or Enter to leave)' % word)
 
 
 def run_mode(db, word):

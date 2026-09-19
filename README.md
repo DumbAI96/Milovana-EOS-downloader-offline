@@ -115,33 +115,37 @@ Settings persist in `state\global\settings.json` (files, not the browser).
 - **A clipboard watch dog** — no file juggling, no Save dialogs. It watches your clipboard; every
   page you copy is classified and filed:
   - **listing page** (search / author / tag) → its meta pairs (title/author/tags/description) go
-    into the **knowledge DB** (`downloader\knowledge.json`) — including each teasе's **type**
+    into the **knowledge DB** (`downloader\knowledge.json`) — including each tease's **type**
     (a Flash/EOS picto-tag on the box = interactive "player"; no picto = simple "static"; TOTM is
     just an award and is ignored)
-  - **simple-tease page** → stored per page; that teasе is created/extended instantly (copy pages
+  - **simple-tease page** → stored per page; that tease is created/extended instantly (copy pages
     in any order, any subset — later copies merge)
   - **player page** (EOS / flash-converted / NyX — verified: they all share the same player
     frame) → a **stub** (wanted; id/title/author taken straight from the page)
-  - **naked teasе link** → a **stub** too (queue whole author pages by copying links) — but only
+  - **naked tease link** → a **stub** too (queue whole author pages by copying links) — but only
     when title+author are already known (copy the listing first; keyless links are skipped)
   - everything else (screenshots, text…) → ignored
-- **`S` mode — type-aware collector:** walks the wanted stubs one at a time: **player** stubs
-  open their `geteosscript` link (you copy the JSON; Ctrl+A, Ctrl+C; no timeout; Enter skips), **static** stubs just open their first page (copy pages whenever), and **type-unknown** stubs
-  open the teasе page first — one copy tells the tool which one it is and the right flow continues
-  automatically (rarely needed now: listings already carry the type). Every teasе in the DB
-  carries its **type** (static / player).
-- **`R` — repair-all, zero prompts:** refreshes every teasе's meta from the DB, then verifies and
-  downloads every file using each teasе's recorded quality+scope (simple conversions are pinned to
+- **`S` mode — the data queue** (menu with 3 modes; it dequeues finished teases first):
+  **1 interactive** — sequential script grabber: player stubs open their `geteosscript` link (you
+  copy the JSON; banking dequeues it), type-unknown stubs open the tease page first (one copy tells
+  the tool which one it is). Enter = pause (stays queued). **2 simple** — the pending static teases
+  as a numbered list (`no pages yet` / `pages 1-7, missing 8-END`): type a **list number or a tease
+  id**, the first page opens, every page you copy merges live, and a complete tease announces
+  `COMPLETE — removed from the queue`. **3 prune** — dequeue a tease for good (**exact id only**;
+  list numbers are refused on purpose). Queued until done: interactive → script banked, simple →
+  complete (END + no gaps), or pruned. Every tease in the DB carries its **type** (static / player).
+- **`R` — repair-all, zero prompts:** refreshes every tease's meta from the DB, then verifies and
+  downloads every file using each tease's recorded quality+scope (simple conversions are pinned to
   the media their pages use — nothing else is ever assumed). **Browser-free.**
 - **`O`** — extract ORPHANED leftovers (see below). **`L`** — list the library.
-- Placeholders (`Unknown` / `no-tags` / `no-description`) fill unknown fields — **but a teasе
+- Placeholders (`Unknown` / `no-tags` / `no-description`) fill unknown fields — **but a tease
   folder is only ever created once title+author are known** (no more "Unknown" folders; stale
   folder names are renamed automatically when titles change, and launch warns about duplicate-id
   folders). Tags are space-separated single words (hyphens for compounds, e.g. `female-top`).
 - **Site-markup parsers live in `downloader\parsers.py`** — the one patch point when the site
   changes.
 - Warning beeps (Windows) on unexpected content, failed parses, skipped ids and R failures.
-- Files the site no longer serves are listed per teasе in `unavailable.txt` and skipped by repairs —
+- Files the site no longer serves are listed per tease in `unavailable.txt` and skipped by repairs —
   delete a line to retry it.
 
 ### Orphan extractor (`O` mode)
@@ -195,10 +199,10 @@ Double-click **`start-downloader.bat`**. You answer exactly one thing: the **ses
 close the window — **copying pages is the whole interface**. (Chrome/Edge: the clipboard's hidden
 HTML flavor carries the page's own address, which is how ids and page numbers arrive.)
 
-- **Listing pages** (search / author / tag) → meta pairs for every teasе on the page go into the
+- **Listing pages** (search / author / tag) → meta pairs for every tease on the page go into the
   knowledge DB. Preload a few hundred any time — this is the bulk metadata move.
 - **Simple-tease pages** (classic page-style, e.g. *The Blue Balls Edging Challenge*) → each copy
-  updates that teasе instantly: the first page creates it, later pages extend it — any order, any
+  updates that tease instantly: the first page creates it, later pages extend it — any order, any
   subset, END page included or not. Missing pages are reported; every later copy merges.
 - **Player teases copy in two halves** (normal — their page is one big iframe): a fresh copy
   *without clicking* comes out **empty** and carries only the **id** (from the page's address);
@@ -206,15 +210,15 @@ HTML flavor carries the page's own address, which is how ids and page numbers ar
   (the player's top bar — it stays there while the tease runs). The tool binds the two together
   (DB match, or the address copy you just made) → stub queued ("wanted", player).
   Nothing opens here — banking happens in `S` mode.
-- **Naked teasе links** (right-click → Copy link address on any teasе title) → a stub too — if
+- **Naked tease links** (right-click → Copy link address on any tease title) → a stub too — if
   title+author are known (copy the listing page first). One author page = a dozen teases queued in
-  seconds, without loading a single teasе page.
-- **`S` mode** → type-aware: **player** stubs open their `geteosscript` link (you copy the JSON as
-  the tab opens; no timeout; Enter skips); **static** stubs just open their first page as a bookmark
-  (copy pages whenever); **unknown** stubs open the teasе page first — copy it once and the tool
-  knows what it is (a page with content = static; an EMPTY copy = player, and its JSON link opens
-  next). Copied pages/listing are absorbed
-  mid-run without breaking it.
+  seconds, without loading a single tease page.
+- **`S` mode** → the data queue: it first dequeues anything already finished, then offers
+  **1 interactive** (sequential; player stubs → `geteosscript` link, unknown → the tease page
+  first; Enter = pause, stays queued), **2 simple** (numbered list of pending static teases with
+  progress; pick by **list number or tease id** → its first page opens; pages merge as you copy;
+  complete = removed from the queue), **3 prune** (dequeue for good — **exact id only**, list
+  numbers refused on purpose). Copied pages/listing are absorbed mid-run without breaking it.
 - **`R`** → refresh + download everything (zero prompts). **`O`** → orphan extractor. **`L`** → list.
 
 Beeps tell you when something unexpected happened (a page that didn't parse, a skipped id, R
