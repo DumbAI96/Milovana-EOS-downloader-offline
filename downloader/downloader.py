@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # Offline tease downloader (stdlib only - no pip packages).
-# Spec: DOWNLOADER-SPEC.md (project root). Console wizard, 8 steps.
+# Spec: DOWNLOADER-SPEC.md (project root).
+# Architecture: a clipboard watch dog. The site parsers live in parsers.py
+# (THE patch point for markup changes); all knowledge lives in knowledge.json
+# (meta pairs, simple-page records, stubs). Teases are only ever written from
+# that knowledge; media is pulled later by R.
 #
 # Self-containment hard rule: everything this tool touches lives inside the
-# offline/ folder - its own venv (downloader/venv), inbox (downloader/incoming),
-# .part temp files next to their targets. Nothing in %TEMP%/%APPDATA%/registry.
-import email
+# offline/ folder - its own venv (downloader/venv), knowledge.json, tease data.
+# Nothing in %TEMP%/%APPDATA%/registry.
 import fnmatch
 import json
 import os
@@ -15,28 +18,35 @@ import shutil
 import sys
 import time
 import webbrowser
-from email import policy
-from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import parsers
+
 try:
-    import ctypes          # Windows clipboard access (Q mode); absent on non-Windows
+    import ctypes          # Windows clipboard (the whole tool runs on it)
 except ImportError:
     ctypes = None
 
 try:
-    import msvcrt           # console key polling for the Q mode link watcher (Windows)
+    import msvcrt           # console key polling (main loop / S mode)
 except ImportError:
     msvcrt = None
+
+try:
+    import winsound         # warning beeps (Windows)
+except ImportError:
+    winsound = None
 
 # ---------------------------------------------------------------- paths / config
 HERE = os.path.dirname(os.path.abspath(__file__))       # offline/downloader
 BASE = os.path.dirname(HERE)                            # offline/
-INCOMING = os.path.join(HERE, "incoming")
-PAGES = os.path.join(HERE, "pages")                     # saved listing pages (Q mode)
-Q_DEFAULTS = os.path.join(HERE, "q_defaults.json")      # remembered batch settings (Q)
 TEASES = os.path.join(BASE, "teases")
+Q_DEFAULTS = os.path.join(HERE, "q_defaults.json")      # remembered session defaults
+DB_PATH = os.path.join(HERE, "knowledge.json")          # the knowledge DB (meta + pages + stubs)
+PLACEHOLDER = {"title": "Unknown", "author": "Unknown",
+               "tags": "no-tags", "description": "no-description"}
+PLACEHOLDERS = set(PLACEHOLDER.values())
 
 MEDIA = "https://media.milovana.com/timg/"
 PAGE_URL = "https://milovana.com/webteases/showtease.php?id={id}"
@@ -74,6 +84,12 @@ EXT_BY_TYPE = {"image/jpeg": "jpg", "audio/mpeg": "mp3"}
 def out(msg=""):
     try:
         print(msg, flush=True)
+    except UnicodeEncodeError:
+        # legacy console codepage cannot render some glyphs - degrade, never crash
+        try:
+            print(str(msg).encode("ascii", "replace").decode(), flush=True)
+        except OSError:
+            pass
     except OSError:
         pass  # stdout closed (e.g. piped to a command that exited) - never crash
 
@@ -308,102 +324,6 @@ def open_in_browser(url):
         out("  -> (could not open the browser automatically: %s)" % e)
 
 
-def print_script_instructions(tease_id):
-    out("")
-    out("  Browser step (milovana.com is Cloudflare-protected - the downloader")
-    out("  cannot fetch the script itself):")
-    out("    Save the page (Ctrl+S) into:  %s" % INCOMING)
-    out("    (any file name works; in the browser wait until you can SEE the JSON")
-    out("     text before saving - a Cloudflare check page saved as file won't work)")
-    out("")
-    open_in_browser(SCRIPT_URL.format(id=tease_id))
-
-
-def find_inbox_script(tease_id):
-    """Find a tease script among the files in the inbox. CONTENT decides validity:
-    any file name / extension works ('geteosscript.json', 'geteosscript (1).json',
-    even 'geteosscript.json.txt'). Preference: 'script-<id>.json' first, then
-    NEWEST file first. Returns ((path, data), [other_valid_paths]) or (None, [])."""
-    if not os.path.isdir(INCOMING):
-        return None, []
-    preferred = os.path.join(INCOMING, "script-%s.json" % tease_id)
-    others = []
-    for name in os.listdir(INCOMING):
-        p = os.path.join(INCOMING, name)
-        if not os.path.isfile(p) or p == preferred:
-            continue
-        if name.startswith(".") or name.lower() == "readme.txt":
-            continue
-        try:
-            others.append((os.path.getmtime(p), p))
-        except OSError:
-            pass
-    others.sort(reverse=True)  # newest first
-    candidates = ([preferred] if os.path.isfile(preferred) else []) + [p for _m, p in others]
-    valid = []
-    for p in candidates:
-        try:
-            with open(p, encoding="utf-8-sig") as f:
-                data = json.load(f)
-            # A tease script is anything with a non-empty 'pages' dict.
-            # 'galleries' is OPTIONAL: nyx/file-based teases have none (they use 'files').
-            if isinstance(data.get("pages"), dict) and data["pages"]:
-                valid.append((p, data))
-        except Exception:
-            continue
-    if not valid:
-        return None, []
-    return valid[0], [p for p, _d in valid[1:]]
-
-
-def inbox_report():
-    """Explain what's in the inbox when nothing usable was found."""
-    if not os.path.isdir(INCOMING):
-        out("  -> the inbox folder does not exist: %s" % INCOMING)
-        return
-    entries = [n for n in sorted(os.listdir(INCOMING))
-               if os.path.isfile(os.path.join(INCOMING, n))
-               and not n.startswith(".") and n.lower() != "readme.txt"]
-    if not entries:
-        out("  -> the inbox is EMPTY - did the browser save somewhere else?")
-        out("     (you can also paste the full path of the saved file here,")
-        out("      or drag the file onto this console window)")
-        return
-    out("  -> inbox contents (nothing usable found):")
-    for n in entries:
-        p = os.path.join(INCOMING, n)
-        try:
-            size = os.path.getsize(p)
-        except OSError:
-            size = -1
-        try:
-            with open(p, encoding="utf-8-sig", errors="replace") as f:
-                head = f.read(400)
-            if head.lstrip()[:1] == "<":
-                verdict = "looks like an HTML page (Cloudflare check?) - in the browser wait until you SEE the JSON text, then save"
-            else:
-                try:
-                    data = json.loads(open(p, encoding="utf-8-sig").read())
-                    if isinstance(data.get("pages"), dict) and data["pages"]:
-                        verdict = "VALID tease script (?) - please report this!"
-                    elif isinstance(data, dict):
-                        verdict = "JSON, but no 'pages' - top-level keys: %s" % \
-                                  ", ".join(list(data.keys())[:8])
-                    else:
-                        verdict = "JSON (%s), but not a tease script" % type(data).__name__
-                except Exception as e:
-                    verdict = "not readable as JSON (%s)" % str(e)[:70]
-        except Exception as e:
-            verdict = "unreadable (%s)" % e
-        out("       %-42s %8s B   %s" % (n[:42], size, verdict))
-
-
-def note_extras(paths):
-    if paths:
-        out("  -> (also in inbox, ignored: %s - delete to avoid confusion)" %
-            ", ".join(os.path.basename(p) for p in paths))
-
-
 def find_existing(tease_id):
     if not os.path.isdir(TEASES):
         return None
@@ -487,69 +407,6 @@ def clean_line(v):
     handled by json.dump on EVERY meta write - quotes, backslashes and unicode
     can never break the file."""
     return re.sub(r"\s+", " ", v).strip()
-
-
-def ask_meta(prev):
-    """Title/author/tags/description prompts.
-    - defined key: Enter keeps the previous value, '-' clears it (stored as "")
-    - missing key: Enter skips -> it stays MISSING (R asks again on a later run)
-    Returns (title, author, tags, description); tags/description None = undefined."""
-    t_prompt = "Title (as shown on the tease page): "
-    if prev.get("title"):
-        t_prompt = "Title [%s] (Enter to keep): " % prev["title"]
-    title = ask(t_prompt)
-    if not title and prev.get("title"):
-        title = prev["title"]
-    while not title:
-        title = ask("Title is required (as shown on the tease page): ")
-    a_prompt = "Author (optional, Enter to skip): "
-    if prev.get("author"):
-        a_prompt = "Author [%s] (Enter to keep, '-' to clear): " % prev["author"]
-    author = ask(a_prompt)
-    if author == "-":
-        author = ""
-    elif not author and prev.get("author"):
-        author = prev["author"]
-
-    def one(key, prompt_new, prompt_keep):
-        if key in prev:
-            cur = prev.get(key) or ""
-            v = ask(prompt_keep % cur)
-        else:
-            v = ask(prompt_new)
-        if v == "-":
-            return ""
-        if not v:
-            return prev.get(key) if key in prev else None
-        return clean_line(v)
-
-    tags = one("tags",
-               "Tags (optional, space-separated, Enter to skip): ",
-               "Tags [%s] (Enter to keep, '-' to clear): ")
-    description = one("description",
-                      "Description (optional, single line, Enter to skip): ",
-                      "Description [%s] (Enter to keep, '-' to clear): ")
-    return title, author, tags, description
-
-
-def prompt_missing_meta(meta, label):
-    """R mode: ask ONLY for meta fields that are MISSING (tags/description).
-    Enter skips a field -> it STAYS missing (a later R asks again).
-    Returns (filled, asked)."""
-    filled = asked = 0
-    if "tags" not in meta:
-        asked += 1
-        v = ask('  Tags for "%s" (space-separated, Enter to skip): ' % label)
-        if v:
-            meta["tags"] = clean_line(v)
-            filled += 1
-    if "description" not in meta:
-        asked += 1
-        v = ask('  Description for "%s" (single line, Enter to skip): ' % label)
-        if v:
-            meta["description"] = clean_line(v)
-            filled += 1
-    return filled, asked
 
 
 def write_info(path, tease_id, title, author, quality, scope, phase, counts, fallbacks=0, failures=0):
@@ -733,18 +590,18 @@ def run_pipeline(folder, script, tease_id, title, author, quality, scope,
             "bad": bad_count, "gone": len(gone_set), "bytes": total_bytes}
 
 
-def repair_all(meta_mode="manual"):
-    """R mode: repair EVERY tease in teases/ using the quality+scope it recorded
-    in its info.txt. meta_mode "manual" asks for missing meta fields (tags/
-    description; Enter skips -> asked again next time); "auto" never prompts.
-    Refetches only missing/suspicious files."""
+def repair_all(db=None):
+    """R: refresh every tease's meta from the knowledge DB, then verify/download
+    its files using the quality+scope it recorded. Never prompts."""
+    if db is None:
+        db = db_load()
     out("")
-    out("=== REPAIR ALL (%s): scanning teases/ (settings from each info.txt) ===" % meta_mode)
+    out("=== REPAIR ALL: meta refresh from DB + file check (settings from each info.txt) ===")
     if not os.path.isdir(TEASES):
         out("  (no teases folder)")
         return
     tot = {"teases": 0, "skipped": 0, "downloaded": 0, "failed": 0,
-           "meta_filled": 0, "meta_open": 0}
+           "bad": 0, "meta_refreshed": 0}
     for name in sorted(os.listdir(TEASES)):
         folder = os.path.join(TEASES, name)
         if not os.path.isdir(folder):
@@ -773,24 +630,33 @@ def repair_all(meta_mode="manual"):
         tot["teases"] += 1
         out("")
         out("--- %s  (quality=%s, scope=%s)" % (name, quality, scope))
-        if meta_mode == "manual":
-            filled, asked = prompt_missing_meta(meta, meta.get("title") or name)
-            if asked:
-                tot["meta_filled"] += filled
-                tot["meta_open"] += asked - filled
-                if filled:
-                    with open(meta_p, "w", encoding="utf-8") as f:
-                        json.dump(meta, f, indent=1)
-                    out("  meta: saved %d field(s)" % filled)
-        else:
-            # auto mode: count what is missing without asking (R will not stop)
-            tot["meta_open"] += ((1 if "tags" not in meta else 0) +
-                                 (1 if "description" not in meta else 0))
+        # DB -> tease meta refresh (real DB values win; placeholders never overwrite)
+        entry = (db.get("teases") or {}).get(str(meta.get("id", "")).strip())
+        if entry:
+            changed = []
+            for key in ("title", "author", "tags", "description"):
+                v = str(entry.get(key) or "").strip()
+                if v and v not in PLACEHOLDERS and str(meta.get(key) or "").strip() != v:
+                    meta[key] = v
+                    changed.append(key)
+            if changed:
+                with open(meta_p, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=1)
+                out("  meta refreshed from DB: %s" % ", ".join(changed))
+                tot["meta_refreshed"] += len(changed)
+        new_folder, was = _sync_folder(str(meta.get("id", "")), meta.get("title"), meta.get("author"))
+        if new_folder and was:
+            out('  folder renamed: "%s" -> "%s"' % (was, os.path.basename(new_folder)))
+            folder = new_folder
+            meta_p = os.path.join(folder, "tease-meta.json")
+            script_p = os.path.join(folder, "tease.json")
+            info_p = os.path.join(folder, "info.txt")
         stats = run_pipeline(folder, script, str(meta.get("id", "?")),
                              meta.get("title", ""), meta.get("author", ""),
                              quality, scope, prev_quality=None, interactive=False)
         tot["downloaded"] += stats["downloaded"]
         tot["failed"] += stats["failed"]
+        tot["bad"] += stats["bad"]
         if stats["bad"] == 0:
             out("  OK - %d/%d files verified%s" %
                 (stats["ok"], stats["total"],
@@ -799,11 +665,12 @@ def repair_all(meta_mode="manual"):
             out("  PARTIAL - %d missing/bad (run R again to retry)" % stats["bad"])
     done_line = ("REPAIR DONE. teases: %d | skipped: %d | downloaded: %d | still failed: %d" %
                  (tot["teases"], tot["skipped"], tot["downloaded"], tot["failed"]))
-    if tot["meta_filled"] or tot["meta_open"]:
-        done_line += " | meta: %d filled, %d left open (asked again next run)" % (
-            tot["meta_filled"], tot["meta_open"])
+    if tot["meta_refreshed"]:
+        done_line += " | meta refreshed from DB: %d field(s)" % tot["meta_refreshed"]
     out("")
     out(done_line)
+    if tot["failed"] or tot["bad"]:
+        beep()
     if tot["failed"]:
         out("Failures are listed in each tease's failed.txt - just run R again.")
 
@@ -1249,180 +1116,7 @@ def orphan_extract():
     out('the Nav panel (filter "ORPH-") roams anywhere.')
 
 
-# ------------------------------------------------- Q mode: pages + clipboard
-
-
-class _TeaseBoxParser(HTMLParser):
-    """Collects the entries of a saved Milovana listing page (search / author /
-    tag pages share one markup): every entry is a <div class="tease"> containing
-    the title link, the author, the description and the tags. Sidebar boxes
-    ("Tease of the Month" / "Random Tease") use different markup -> ignored."""
-
-    def __init__(self):
-        HTMLParser.__init__(self, convert_charrefs=True)
-        self.entries = []
-        self._div_depth = 0
-        self._entry = None
-        self._entry_depth = 0
-        self._context = None        # author | desc | tags
-        self._ctx_div_depth = 0
-        self._in_a = False
-        self._a_buf = []
-        self._h1 = False
-
-    def _new_entry(self):
-        return {"id": None, "title": "", "author": "", "desc": "", "tags": []}
-
-    def _finish_entry(self):
-        e = self._entry
-        if e and e["id"] and e["title"]:
-            e["title"] = " ".join(e["title"].split())
-            e["author"] = " ".join(e["author"].split())
-            e["desc"] = " ".join(e["desc"].split())
-            self.entries.append(e)
-        self._entry = None
-        self._context = None
-        self._in_a = False
-        self._a_buf = []
-        self._h1 = False
-
-    def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
-        classes = (a.get("class") or "").split()
-        if tag == "div":
-            self._div_depth += 1
-            if "tease" in classes and self._entry is None:
-                self._entry = self._new_entry()
-                self._entry_depth = self._div_depth
-            elif self._entry is not None and "author" in classes:
-                self._context = "author"
-                self._ctx_div_depth = self._div_depth
-            elif self._entry is not None and "desc" in classes:
-                self._context = "desc"
-                self._ctx_div_depth = self._div_depth
-            elif self._entry is not None and "tags" in classes:
-                self._context = "tags"
-                self._ctx_div_depth = self._div_depth
-        elif tag == "h1" and self._entry is not None:
-            self._h1 = True
-        elif tag == "a":
-            self._in_a = True
-            self._a_buf = []
-            if self._entry is not None and self._entry["id"] is None:
-                m = re.search(r"showtease\.php\?id=(\d+)", a.get("href") or "")
-                if m:
-                    self._entry["id"] = m.group(1)
-
-    def handle_endtag(self, tag):
-        if tag == "div":
-            if (self._entry is not None and self._context
-                    and self._div_depth == self._ctx_div_depth):
-                self._context = None
-            self._div_depth -= 1
-            if self._entry is not None and self._div_depth < self._entry_depth:
-                self._finish_entry()
-        elif tag == "h1":
-            self._h1 = False
-        elif tag == "a":
-            text = " ".join("".join(self._a_buf).split())
-            was_in_a = self._in_a
-            self._in_a = False
-            self._a_buf = []
-            if self._entry is None or not was_in_a or not text:
-                return
-            if self._h1:
-                self._entry["title"] = (self._entry["title"] + " " + text).strip()
-            elif self._context == "author" and not self._entry["author"]:
-                self._entry["author"] = text
-            elif self._context == "tags":
-                self._entry["tags"].append(text)
-            elif self._context == "desc":
-                self._entry["desc"] += " " + text
-
-    def handle_data(self, data):
-        if self._entry is None or not data:
-            return
-        if self._in_a:
-            self._a_buf.append(data)
-        elif self._context == "desc":
-            self._entry["desc"] += data
-
-
-def parse_tease_boxes(html_text):
-    """One saved listing page -> list of entry dicts (id/title/author/desc/tags)."""
-    p = _TeaseBoxParser()
-    try:
-        p.feed(html_text)
-        p.close()
-    except Exception:
-        pass
-    return p.entries
-
-
-def load_page_html(path):
-    """Read a saved page - plain .html or Chrome/Firefox .mhtml - -> HTML text."""
-    try:
-        raw = open(path, "rb").read()
-    except OSError:
-        return None
-    low = raw[:6000].lower()
-    if b"mime-version" in low and b"boundary=" in low:
-        try:
-            msg = email.message_from_bytes(raw, policy=policy.default)
-            for part in msg.walk():
-                if part.get_content_type() == "text/html":
-                    data = part.get_payload(decode=True) or b""
-                    encs = ([part.get_content_charset()] if part.get_content_charset() else [])
-                    for enc in encs + ["utf-8", "cp1252", "latin-1"]:
-                        try:
-                            return data.decode(enc)
-                        except Exception:
-                            continue
-                    return data.decode("utf-8", "replace")
-        except Exception:
-            return None
-        return None
-    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-        try:
-            return raw.decode(enc)
-        except Exception:
-            continue
-    return raw.decode("utf-8", "replace")
-
-
-_PAGE_CACHE = {}    # abs path -> ((mtime, size), entries)
-
-
-def scan_pages():
-    """Parse every saved page in downloader/pages/ -> {tease id: entry}.
-    Per-file cache (mtime+size) keeps re-scans instant while you add pages."""
-    index = {}
-    if not os.path.isdir(PAGES):
-        return index
-    for name in sorted(os.listdir(PAGES)):
-        low = name.lower()
-        if not low.endswith((".html", ".htm", ".mhtml", ".mht")):
-            continue
-        p = os.path.join(PAGES, name)
-        if not os.path.isfile(p):
-            continue
-        try:
-            st = os.stat(p)
-            key = (st.st_mtime, st.st_size)
-        except OSError:
-            continue
-        cached = _PAGE_CACHE.get(p)
-        if cached and cached[0] == key:
-            entries = cached[1]
-        else:
-            html_text = load_page_html(p)
-            entries = parse_tease_boxes(html_text) if html_text else []
-            _PAGE_CACHE[p] = (key, entries)
-        for e in entries:
-            if e["id"] not in index:
-                index[e["id"]] = e
-    return index
-
+# ---------------------------------------------------------------- clipboard
 
 _CLIP_API = None
 
@@ -1442,6 +1136,8 @@ def _clip_api():
             u.GetClipboardData.argtypes = [ctypes.c_uint]
             u.GetClipboardData.restype = ctypes.c_void_p
             u.GetClipboardSequenceNumber.restype = ctypes.c_uint
+            u.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+            u.RegisterClipboardFormatW.restype = ctypes.c_uint
             k.GlobalLock.argtypes = [ctypes.c_void_p]
             k.GlobalLock.restype = ctypes.c_void_p
             k.GlobalUnlock.argtypes = [ctypes.c_void_p]
@@ -1478,6 +1174,53 @@ def clipboard_text():
         return None
 
 
+def clipboard_html():
+    """The clipboard's HTML flavor: (fragment_html, source_url) or (None, None).
+    Chrome/Edge attach this to every page copy - SourceURL carries the page's
+    own address (which gives us ids and page numbers)."""
+    api = _clip_api()
+    if not api:
+        return None, None
+    u, k = api
+    try:
+        fmt = u.RegisterClipboardFormatW("HTML Format")
+        if not fmt:
+            return None, None
+        if not u.OpenClipboard(None):
+            return None, None
+        try:
+            h = u.GetClipboardData(fmt)
+            if not h:
+                return None, None
+            p = k.GlobalLock(h)
+            if not p:
+                return None, None
+            try:
+                raw = ctypes.string_at(p)
+            finally:
+                k.GlobalUnlock(h)
+        finally:
+            u.CloseClipboard()
+    except Exception:
+        return None, None
+    head = raw[:4000].decode("utf-8", "replace")
+    src = None
+    m = re.search(r"SourceURL:(\S+)", head)
+    if m:
+        src = m.group(1)
+    frag = None
+    m1 = re.search(r"StartFragment:(\d+)", head)
+    m2 = re.search(r"EndFragment:(\d+)", head)
+    if m1 and m2:
+        try:
+            frag = raw[int(m1.group(1)):int(m2.group(1))].decode("utf-8", "replace")
+        except Exception:
+            frag = None
+    if frag is None:
+        frag = raw.decode("utf-8", "replace")
+    return frag, src
+
+
 def _clipboard_seq():
     """Windows clipboard change counter (0 when unavailable)."""
     api = _clip_api()
@@ -1489,9 +1232,455 @@ def _clipboard_seq():
         return 0
 
 
-def _looks_like_tease_json(txt):
-    """True when txt parses as JSON with a non-empty 'pages' dict
-    (the same validity rule the inbox uses)."""
+def read_payload():
+    """Whatever is on the clipboard right now: (text, page_html, source_url)."""
+    html_text, src = clipboard_html()
+    return clipboard_text(), html_text, src
+
+
+# ------------------------------------------------------------------- sounds
+
+
+def beep():
+    """Windows warning sound for unexpected / failed steps (silent elsewhere)."""
+    if winsound is None:
+        return
+    try:
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------- knowledge DB
+
+
+def db_load():
+    try:
+        with open(DB_PATH, encoding="utf-8") as f:
+            db = json.load(f)
+        if isinstance(db, dict) and isinstance(db.get("teases"), dict):
+            return db
+    except Exception:
+        pass
+    return {"version": 1, "teases": {}}
+
+
+def db_save(db):
+    try:
+        with open(DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(db, f, indent=1, ensure_ascii=False)
+    except OSError as e:
+        out("  !! could not write the knowledge DB: %s" % e)
+
+
+def db_entry(db, tid):
+    """Get or create the entry for a tease id (unknowns get placeholders)."""
+    tid = str(tid)
+    e = db["teases"].get(tid)
+    if e is None:
+        e = dict(PLACEHOLDER)
+        db["teases"][tid] = e
+    return e
+
+
+def db_set_real(e, field, value):
+    """Set a field from a REAL source. Empty cells become placeholders so every
+    key always exists; real values always overwrite."""
+    v = str(value or "").strip()
+    if not v or v in PLACEHOLDERS:
+        v = PLACEHOLDER.get(field, "Unknown")
+    e[field] = v
+
+
+def db_fill(e, field, value):
+    """Gap-fill from a page copy: only when the current value is unknown."""
+    cur = str(e.get(field) or "").strip()
+    v = str(value or "").strip()
+    if v and v not in PLACEHOLDERS and (not cur or cur in PLACEHOLDERS):
+        e[field] = v
+
+
+def _has_keys(e):
+    """True when title + author are known for real (folders only get these)."""
+    if not e:
+        return False
+    t = str(e.get("title") or "").strip()
+    a = str(e.get("author") or "").strip()
+    return bool(t) and t not in PLACEHOLDERS and bool(a) and a not in PLACEHOLDERS
+
+
+def db_stub(db, tid, assumed=None):
+    e = db_entry(db, tid)
+    e["wanted"] = True
+    if assumed:
+        e["assumed"] = assumed
+    return e
+
+
+def db_want_ids(db):
+    """Wanted ids with a known title+author and still no data (no script, no
+    simple pages). Stubs without keys are rejected at creation time."""
+    ids = []
+    for tid, e in db["teases"].items():
+        if not e.get("wanted"):
+            continue
+        if e.get("has_script") or e.get("pages"):
+            continue
+        if not _has_keys(e):
+            continue
+        ids.append(tid)
+    return ids
+
+
+def _fmt_numbers(nums):
+    """[1,2,3,7,8] -> '1-3, 7-8'"""
+    nums = sorted(nums)
+    parts, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        parts.append(str(nums[i]) if j == i else "%d-%d" % (nums[i], nums[j]))
+        i = j + 1
+    return ", ".join(parts)
+
+
+def _label(db, tid):
+    e = db_entry(db, tid)
+    return '%s "%s"' % (tid, e.get("title") or "Unknown")
+
+
+# ------------------------------------------------------------------- import
+
+
+def _rebuild_simple_pages(folder, meta, e):
+    """Recover page records from a converted simple-tease script, so future
+    page copies MERGE instead of wiping the tease."""
+    try:
+        with open(os.path.join(folder, "tease.json"), encoding="utf-8") as f:
+            script = json.load(f)
+        quality, _scope = parse_info(os.path.join(folder, "info.txt"))
+        files = script.get("files") or {}
+        pages = {}
+        for pid, cmds in (script.get("pages") or {}).items():
+            m = re.fullmatch(r"P(\d+)", str(pid))
+            if not m:
+                continue
+            num = int(m.group(1))
+            imgs = []
+            text = ""
+            end = False
+            for c in cmds or []:
+                if not isinstance(c, dict):
+                    continue
+                if "image" in c:
+                    loc = (c.get("image") or {}).get("locator") or ""
+                    if loc.startswith("file:"):
+                        name = loc[5:]
+                        h = (files.get(name) or {}).get("hash")
+                        ext = name.rsplit(".", 1)[-1] if "." in name else "jpg"
+                        if h:
+                            imgs.append([name, h, ext,
+                                         quality if quality in ("s", "m", "l", "xl") else None])
+                elif "say" in c:
+                    text = (c.get("say") or {}).get("label") or ""
+                elif "end" in c:
+                    end = True
+            pages[str(num)] = {"images": imgs, "text": text, "end": end}
+        if pages and not e.get("pages"):
+            e["pages"] = pages
+    except Exception:
+        pass
+
+
+def import_teases(db):
+    """teases\\ -> DB (on launch). Folders only FILL GAPS: real DB values (e.g.
+    fresher listing data) always survive; placeholders are never copied over
+    real values; simple conversions get their pages rebuilt. ORPHANED copies
+    are left alone (utility folders, not teases)."""
+    n = 0
+    seen = {}
+    if not os.path.isdir(TEASES):
+        return n
+    for name in sorted(os.listdir(TEASES)):
+        folder = os.path.join(TEASES, name)
+        meta_p = os.path.join(folder, "tease-meta.json")
+        if not os.path.isdir(folder) or not os.path.isfile(meta_p):
+            continue
+        try:
+            with open(meta_p, encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            continue
+        tid = str(meta.get("id") or "").strip()
+        if not tid:
+            continue
+        if str(meta.get("title") or "").strip().endswith("(ORPHANED)"):
+            continue                      # utility folder - never a tease entry
+        if tid in seen:
+            beep()
+            out('  warning: duplicate tease folders for id %s: "%s" and "%s"' % (tid, seen[tid], name))
+            out("           (delete the stale one - folder names must match title changes)")
+            continue
+        seen[tid] = name
+        e = db_entry(db, tid)
+        for key in ("title", "author", "tags", "description"):
+            v = str(meta.get(key) or "").strip()
+            cur = str(e.get(key) or "").strip()
+            if v and v not in PLACEHOLDERS and (not cur or cur in PLACEHOLDERS):
+                e[key] = v      # folders fill gaps; real DB values win
+        if os.path.isfile(os.path.join(folder, "tease.json")):
+            e["has_script"] = True
+        if meta.get("source") == "simple-tease":
+            e["type"] = "static"
+            _rebuild_simple_pages(folder, meta, e)
+        else:
+            e["type"] = "player"
+        n += 1
+    return n
+
+
+def _find_folder_by_id(tid):
+    """The tease folder for this id (ORPHANED copies excluded), or None."""
+    if not os.path.isdir(TEASES):
+        return None
+    for name in sorted(os.listdir(TEASES)):
+        folder = os.path.join(TEASES, name)
+        meta_p = os.path.join(folder, "tease-meta.json")
+        if not os.path.isdir(folder) or not os.path.isfile(meta_p):
+            continue
+        try:
+            with open(meta_p, encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            continue
+        if str(meta.get("id")) != str(tid):
+            continue
+        if str(meta.get("title") or "").strip().endswith("(ORPHANED)"):
+            continue
+        return folder
+    return None
+
+
+def _sync_folder(tid, title, author):
+    """The folder for this id, created as 'id title' - and RENAMED when the
+    title changed (no stale 'Unknown' folders, no duplicates). Never creates
+    anything before title+author are known. Returns (folder, renamed_from)."""
+    t = str(title or "").strip()
+    a = str(author or "").strip()
+    if (not t) or t in PLACEHOLDERS or (not a) or a in PLACEHOLDERS:
+        return None, None
+    desired = os.path.join(TEASES, sanitize("%s %s" % (tid, title)))
+    cur = _find_folder_by_id(tid)
+    if cur is None:
+        os.makedirs(desired, exist_ok=True)
+        return desired, None
+    if os.path.normcase(os.path.abspath(cur)) == os.path.normcase(os.path.abspath(desired)):
+        return cur, None
+    if os.path.exists(desired):
+        return cur, None                  # that name is taken - keep as is
+    try:
+        os.rename(cur, desired)
+        return desired, os.path.basename(cur)
+    except OSError:
+        return cur, None
+
+
+def _meta_for(db, tid):
+    e = db_entry(db, tid)
+    meta = {"id": int(tid),
+            "title": str(e.get("title") or PLACEHOLDER["title"]),
+            "author": str(e.get("author") or PLACEHOLDER["author"])}
+    for key in ("tags", "description"):
+        v = str(e.get(key) or "").strip()
+        if v:
+            meta[key] = v
+    return meta
+
+
+def write_tease_from_script(db, tid, script):
+    """A banked EOS script -> tease folder (script + meta + info; media via R).
+    Only ever writes when title+author are known; renames stale folders.
+    Returns (folder, None) or (None, reason)."""
+    meta = _meta_for(db, tid)
+    folder, was = _sync_folder(tid, meta["title"], meta["author"])
+    if folder is None:
+        return None, "no title/author known yet"
+    if was:
+        out('    (folder renamed: "%s" -> "%s")' % (was, os.path.basename(folder)))
+    with open(os.path.join(folder, "tease.json"), "w", encoding="utf-8") as f:
+        json.dump(script, f)
+    with open(os.path.join(folder, "tease-meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=1)
+    quality, scope = load_q_defaults()
+    write_info(os.path.join(folder, "info.txt"), tid, meta["title"], meta["author"],
+               quality, scope, "SCRIPT BANKED - run R to fetch the media", None)
+    e = db_entry(db, tid)
+    e["has_script"] = True
+    e["type"] = "player"
+    return folder, None
+
+
+def convert_simple(db, tid):
+    """(Re)build the converted tease from ALL page records in the DB.
+    Simple conversions are PINNED to what the pages themselves use (tier +
+    used-only) - nothing else is ever assumed to exist.
+    Returns (result, None) or (None, reason)."""
+    e = db_entry(db, tid)
+    pages = e.get("pages") or {}
+    if not pages:
+        return None, "no pages yet"
+    nums = sorted(int(n) for n in pages)
+    end_nums = [n for n in nums if pages[str(n)].get("end")]
+    end_num = max(end_nums) if end_nums else None      # a re-copied higher END wins
+    missing = [n for n in range(1, (end_num or nums[-1]) + 1)
+               if str(n) not in pages and n != end_num]
+
+    if not _has_keys(e):
+        # pages live in the DB; a folder only ever appears with a real name
+        return {"folder": None, "pending": True, "pages": nums, "end": end_num,
+                "missing": missing, "images": 0}, None
+
+    files = {}
+    script_pages = {}
+    ordered = []
+    for n in nums:
+        rec = pages[str(n)]
+        pid = "P%04d" % n
+        cmds = []
+        for img in rec.get("images") or []:
+            name, h, ext = img[0], img[1], img[2]
+            tier = img[3] if len(img) > 3 else None
+            files[name] = {"hash": h, "type": parsers.mime_for_ext(ext)}
+            cmd = {"locator": "file:%s" % name}
+            if tier:
+                cmd["size"] = tier
+            cmds.append({"image": cmd})
+        cmds.append({"say": {"label": rec.get("text") or "&nbsp;", "mode": "pause"}})
+        cmds.append({"end": {}})
+        ordered.append((pid, n, cmds))
+    for i, (pid, n, cmds) in enumerate(ordered):
+        terminal = (end_num is not None and n == end_num)
+        if not terminal and i + 1 < len(ordered):
+            cmds[-1] = {"goto": {"target": ordered[i + 1][0]}}
+        script_pages[pid] = cmds
+    script_pages["start"] = [{"goto": {"target": ordered[0][0]}}]
+    script = {"pages": script_pages, "files": files}
+
+    tiers = [img[3] for n in nums for img in (pages[str(n)].get("images") or [])
+             if len(img) > 3 and img[3]]
+    quality = max(set(tiers), key=tiers.count) if tiers else "original"
+
+    meta = _meta_for(db, tid)
+    meta["source"] = "simple-tease"
+    e["type"] = "static"
+    folder, was = _sync_folder(tid, meta["title"], meta["author"])
+    if was:
+        out('    (folder renamed: "%s" -> "%s")' % (was, os.path.basename(folder)))
+    with open(os.path.join(folder, "tease.json"), "w", encoding="utf-8") as f:
+        json.dump(script, f)
+    with open(os.path.join(folder, "tease-meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=1)
+    write_info(os.path.join(folder, "info.txt"), tid, meta["title"], meta["author"],
+               quality, "used-only",
+               "CONVERTED SIMPLE TEASE (%d page(s) saved%s) - run R to fetch the images" % (
+                   len(nums), ", END=%d" % end_num if end_num else ", NO END PAGE"),
+               "%d page(s); missing: %s" % (len(nums),
+                                            _fmt_numbers(missing) if missing else "none"))
+    return {"folder": folder, "pending": False, "pages": nums, "end": end_num,
+            "missing": missing, "images": len(files)}, None
+
+
+# ------------------------------------------------------------------ handlers
+
+
+def handle_listing(db, entries):
+    new = upd = 0
+    for it in entries:
+        tid = str(it["id"])
+        existed = tid in db["teases"]
+        e = db_entry(db, tid)
+        before = (e.get("title"), e.get("author"), e.get("tags"), e.get("description"),
+                  e.get("type"))
+        db_set_real(e, "title", it.get("title"))
+        db_set_real(e, "author", it.get("author"))
+        db_set_real(e, "tags", " ".join(it.get("tags") or []))
+        db_set_real(e, "description", it.get("desc"))
+        if it.get("type"):
+            e["type"] = it["type"]          # listings are authoritative (Flash/EOS picto = player)
+        after = (e.get("title"), e.get("author"), e.get("tags"), e.get("description"),
+                 e.get("type"))
+        if not existed:
+            new += 1
+        elif before != after:
+            upd += 1
+    players = sum(1 for it in entries if it.get("type") == "player")
+    out("  listing: %d meta pair(s) read (%d new, %d refreshed; %d player / %d static)"
+        % (len(entries), new, upd, players, len(entries) - players))
+
+
+def handle_simple(db, rec):
+    tid = str(rec["id"])
+    e = db_entry(db, tid)
+    db_fill(e, "title", rec.get("title"))
+    db_fill(e, "author", rec.get("author"))
+    e["type"] = "static"
+    e.setdefault("pages", {})[str(rec["page"])] = {
+        "images": rec["images"], "text": rec["text"], "end": bool(rec["end"])}
+    res, err = convert_simple(db, tid)
+    if err:
+        out("  %s: page stored, but conversion failed (%s)" % (_label(db, tid), err))
+        beep()
+        return
+    if res.get("pending"):
+        out('  %s page %d stored - the folder appears once title+author are known' %
+            (_label(db, tid), rec["page"]))
+        out("    (copy a listing page that contains this tease, then copy any of its pages again)")
+        return
+    extra = []
+    if res["end"] is None:
+        extra.append("no END yet")
+    if res["missing"]:
+        extra.append("missing " + _fmt_numbers(res["missing"]))
+    out('  %s page %d saved \u2192 tease updated: pages %s%s%s' % (
+        _label(db, tid), rec["page"], _fmt_numbers(res["pages"]),
+        (" + END(%d)" % res["end"]) if res["end"] else "",
+        ("  \u2014 %s" % "; ".join(extra)) if extra else ""))
+
+
+def handle_player(db, tid, page_title="", page_author=""):
+    e = db_entry(db, tid)
+    db_fill(e, "title", page_title)
+    db_fill(e, "author", page_author)
+    if e.get("has_script") or e.get("pages"):
+        out('  player page: %s  (already have its data - nothing queued)' % _label(db, tid))
+        return
+    if not _has_keys(e):
+        beep()
+        out("  player page for %s: could not read title/author from it - skipped" % tid)
+        out("    (keep that page - it is a parser patch sample!)")
+        return
+    e["type"] = "player"
+    db_stub(db, tid, assumed="player")
+    out('  player page \u2192 stub: %s  (script pending - S mode banks it)' % _label(db, tid))
+
+
+def handle_link(db, tid):
+    e = db_entry(db, tid)
+    if e.get("has_script") or e.get("pages"):
+        out('  link: %s  (already have its data - nothing queued)' % _label(db, tid))
+        return
+    if not _has_keys(e):
+        beep()
+        out("  link: %s  (no title/author known yet - copy a page that lists this tease" % tid)
+        out("    first, then copy the link again - skipped)")
+        return
+    db_stub(db, tid, assumed="player")
+    out('  link \u2192 stub: %s  (queued - S mode banks it later)' % _label(db, tid))
+
+
+def looks_like_script_json(txt):
+    """A valid EOS script copy: JSON with a non-empty 'pages' dict."""
     if not txt:
         return False
     t = txt.lstrip("\ufeff\r\n\t ")
@@ -1504,87 +1693,259 @@ def _looks_like_tease_json(txt):
     return isinstance(data, dict) and isinstance(data.get("pages"), dict) and bool(data["pages"])
 
 
-def wait_for_tease_json(prev_text, interval=0.25, timeout=180):
-    """Poll the clipboard until a NEW copy of a valid tease JSON appears.
-    "New" = the Windows clipboard sequence number changed since the wait began,
-    so a stale copy of an older script is never matched. Returns (text, None)
-    or (None, reason)."""
-    seq0 = _clipboard_seq()
-    use_seq = seq0 != 0
-    waited = 0.0
-    hinted = False
-    while waited < timeout:
-        time.sleep(interval)
-        waited += interval
-        if use_seq:
-            seq = _clipboard_seq()
-            if seq == seq0:
+def process_payload(db, text, page_html, source_url):
+    """Handle one clipboard payload by its kind. Returns a small dict describing
+    what was handled ({'kind', 'id'}) - or None for unrelated junk (silent)."""
+    if page_html:
+        what = parsers.classify_page(page_html, source_url)
+        if what is None:
+            if source_url and "milovana.com" in source_url:
+                beep()
+                out("  that Milovana page did not parse (site may have failed to load) - ignored.")
+                return {"kind": "bad-page"}
+            return None
+        if what["kind"] == "listing":
+            handle_listing(db, what["entries"])
+            db_save(db)
+            return {"kind": "listing", "count": len(what["entries"])}
+        if what["kind"] == "simple":
+            handle_simple(db, what["page"])
+            db_save(db)
+            return {"kind": "simple", "id": str(what["page"]["id"])}
+        if what["kind"] == "player":
+            handle_player(db, what["id"], what.get("title", ""), what.get("author", ""))
+            db_save(db)
+            return {"kind": "player", "id": str(what["id"])}
+    if text:
+        tid = parsers.tease_id_from_link(text)
+        if tid:
+            handle_link(db, tid)
+            db_save(db)
+            return {"kind": "link", "id": tid}
+    return None
+
+
+# ---------------------------------------------------------------- S mode
+
+
+def _s_left(db, ids):
+    n = 0
+    for t in ids:
+        e = db.get("teases", {}).get(t) or {}
+        if e.get("wanted") and not e.get("has_script") and not e.get("pages"):
+            n += 1
+    return n
+
+
+def mode_grab_scripts(db):
+    """S: collect the missing data, driven by each stub's TYPE:
+    - player  -> open the geteosscript link and wait for that JSON copy
+    - static  -> open the tease's first page (a bookmark; copy pages whenever)
+    - unknown -> open the tease page first to LEARN the type (copy it once):
+                 static -> its first page is stored; player -> the JSON opens next.
+    Enter = skip the current id; any copied page/listing is absorbed mid-wait."""
+    ids = db_want_ids(db)
+    if not ids:
+        out("  S: nothing to grab - no wanted stubs without data (with title+author known).")
+        return
+    out("")
+    out("  S MODE - %d wanted stub(s), one at a time (Enter = skip the current one):" % len(ids))
+    out("    player teases -> geteosscript link opens; copy that JSON (Ctrl+A, Ctrl+C)")
+    out("    unknown       -> the tease page opens first; copy it so I can tell what it is")
+    out("    static        -> its first page just opens (copy its pages whenever)")
+    _OPENED_URLS.clear()
+    banked = skipped = 0
+    idx = 0
+    while idx < len(ids):
+        tid = ids[idx]
+        e = db.get("teases", {}).get(tid) or {}
+        if not e.get("wanted") or e.get("has_script") or e.get("pages") or not _has_keys(e):
+            idx += 1
+            continue
+        ttype = e.get("type")
+        if ttype == "static":
+            out("")
+            out('  %s is a static tease - opening its first page: showtease.php?id=%s' % (_label(db, tid), tid))
+            open_in_browser(PAGE_URL.format(id=tid))
+            out("    copy its pages whenever you like - each one merges into the tease.")
+            idx += 1
+            continue
+        phase = "json" if ttype == "player" else "learn"
+        if phase == "json":
+            out("")
+            out('  [%d left] opening geteosscript.php?id=%s  %s' % (_s_left(db, ids), tid, _label(db, tid)))
+            open_in_browser(SCRIPT_URL.format(id=tid))
+            out('    waiting for the script - Ctrl+A, Ctrl+C in the tab that just opened. (Enter = skip)')
+        else:
+            out("")
+            out('  [%d left] %s - no type known yet; opening its tease page: showtease.php?id=%s' %
+                (_s_left(db, ids), _label(db, tid), tid))
+            open_in_browser(PAGE_URL.format(id=tid))
+            out('    copy that page (Ctrl+A, Ctrl+C) so I can tell static from player. (Enter = skip)')
+        outcome = None
+        buf = ""
+        if msvcrt is not None:
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        seq = _clipboard_seq()
+        use_seq = seq != 0
+        last = None if use_seq else clipboard_text()
+        while outcome is None:
+            time.sleep(0.25)
+            if msvcrt is not None:
+                while msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch in ("\r", "\n"):
+                        word = buf.strip().lower()
+                        buf = ""
+                        if word:
+                            print()
+                        if not word:
+                            outcome = "skip"
+                            break
+                        if word in ("o", "l", "r", "s"):
+                            outcome = word
+                            break
+                        out('  (unknown input "%s" - modes: O, L, R, S; Enter = skip)' % word)
+                        beep()
+                        continue
+                    if ch in ("\x00", "\xe0"):
+                        if msvcrt.kbhit():
+                            msvcrt.getwch()
+                        continue
+                    if ch == "\b":
+                        if buf:
+                            buf = buf[:-1]
+                            print("\b \b", end="", flush=True)
+                        continue
+                    if ch == "\x03":
+                        raise KeyboardInterrupt
+                    if ch.isprintable():
+                        buf += ch
+                        print(ch, end="", flush=True)
+                if outcome is not None:
+                    break
+            changed = False
+            if use_seq:
+                s2 = _clipboard_seq()
+                if s2 != seq:
+                    seq = s2
+                    changed = True
+            else:
+                t = clipboard_text()
+                if t is not None and t != last:
+                    last = t
+                    changed = True
+            if not changed:
                 continue
-            seq0 = seq
-        cur = clipboard_text()
-        if _looks_like_tease_json(cur) and (use_seq or cur != prev_text):
-            return cur, None
-        if waited > 4 and not hinted:
-            out("  ... still waiting - in the opened tab: Ctrl+A, Ctrl+C")
-            hinted = True
-    return None, "timeout"
+            text, html_text, src = read_payload()
+            if phase == "json" and looks_like_script_json(text):
+                try:
+                    script = json.loads(text.lstrip("\ufeff"))
+                except Exception:
+                    script = None
+                if script is None:
+                    out("  could not read that JSON - still waiting. (Enter = skip)")
+                    beep()
+                    continue
+                src_id = parsers.tease_id_from_url(src) if src else None
+                bind = str(src_id) if src_id else tid
+                folder, werr = write_tease_from_script(db, bind, script)
+                if folder is None:
+                    beep()
+                    out("  cannot bank %s: %s - skipped (copy a page for it, then run S again)" % (bind, werr))
+                    skipped += 1
+                    outcome = "next"
+                    continue
+                db_save(db)
+                banked += 1
+                out('  banked: %s "%s" - script written (%d pages / %d files)' % (
+                    bind, (db["teases"].get(bind, {}) or {}).get("title") or "Unknown",
+                    len(script.get("pages") or {}), len(script.get("files") or {})))
+                if bind != tid:
+                    beep()
+                    out('  note: that script came from id %s - banked there; still waiting for %s.' % (bind, tid))
+                    continue
+                outcome = "next"
+                continue
+            info = process_payload(db, text, html_text, src)
+            if info and info.get("kind") == "simple" and info.get("id") == tid:
+                out("    that was page 1 of a static tease - stored; more pages merge as you copy them.")
+                outcome = "next"
+            elif info and info.get("kind") == "player" and info.get("id") == tid and phase == "learn":
+                out("    it is a player tease! opening its geteosscript link now...")
+                open_in_browser(SCRIPT_URL.format(id=tid))
+                out('    waiting for the script - Ctrl+A, Ctrl+C in the tab that opened. (Enter = skip)')
+                phase = "json"
+            elif info:
+                out('    (absorbed - still on %s "%s"; Enter = skip)' % (tid, e.get("title") or "Unknown"))
+            else:
+                out('    that was not usable content - still on %s "%s". (Enter = skip)' % (tid, e.get("title") or "Unknown"))
+                beep()
+        if outcome == "skip":
+            out('  skipped: %s "%s"' % (tid, e.get("title") or "Unknown"))
+            beep()
+            skipped += 1
+            idx += 1
+        elif outcome in ("o", "l", "r", "s"):
+            out("  leaving S mode...")
+            run_mode(db, outcome)
+            return
+        elif outcome == "next":
+            idx += 1
+    out("")
+    out("  S done: %d banked, %d skipped." % (banked, skipped))
 
 
-def watch_link_prompt(interval=0.25):
-    """Q mode's link input. A copied tease LINK (showtease.php?id=...) is picked
-    up from the clipboard automatically; typing/pasting in the console still
-    works; Enter on an empty line leaves Q mode (unless a fresh link is waiting
-    on the clipboard - then that link wins). Returns the link/id string or None."""
-    seq0 = _clipboard_seq()
-    use_seq = seq0 != 0
+def run_mode(db, word):
+    if word == "o":
+        orphan_extract()
+    elif word == "l":
+        list_existing()
+    elif word == "r":
+        repair_all(db)
+    elif word == "s":
+        mode_grab_scripts(db)
+    out("")
+    out("  back to the main loop - copy pages, or type a mode letter.")
+
+
+def main_loop(db):
+    """The always-on watchdog: console mode letters + clipboard payloads."""
+    out("")
+    out("=" * 66)
+    out("  READY - copy pages straight from the site:")
+    out("    listing page  -> meta pairs into the DB")
+    out("    simple page   -> that tease is created/extended (per page)")
+    out("    player page   -> stub (script via S mode)")
+    out("    tease link    -> stub (script via S mode)")
+    out("  Modes (type + Enter):  O orphan-extract | L list | R repair-all | S grab-scripts")
+    out("  Exit: close the window or Ctrl+C.")
+    out("=" * 66)
+    seq = _clipboard_seq()
+    use_seq = seq != 0
     last_text = None if use_seq else clipboard_text()
     buf = ""
-
-    def clip_check():
-        # a NEW tease link on the clipboard -> its id, else None
-        nonlocal seq0, last_text
-        txt = None
-        if use_seq:
-            seq = _clipboard_seq()
-            if seq != seq0:
-                seq0 = seq
-                txt = clipboard_text()
-        else:
-            t = clipboard_text()
-            if t is not None and t != last_text:
-                last_text = t
-                txt = t
-        if not txt:
-            return None
-        m = re.search(r"showtease\.php\?[^\s]*?id=(\d+)", txt)
-        if m:
-            return m.group(1)
-        out("  (clipboard changed, but it holds no tease link - still watching)")
-        return None
-
-    if msvcrt is not None:      # drop keys typed while the previous step ran
+    if msvcrt is not None:
         while msvcrt.kbhit():
             msvcrt.getwch()
-
-    out("  next: copy a tease LINK - it is picked up from the clipboard automatically.")
-    out("  (Typing/pasting a link here also works; Enter on an empty line = leave Q.)")
     while True:
-        time.sleep(interval)
+        time.sleep(0.25)
         if msvcrt is not None:
             while msvcrt.kbhit():
                 ch = msvcrt.getwch()
                 if ch in ("\r", "\n"):
-                    if buf:
+                    word = buf.strip().lower()
+                    buf = ""
+                    if word:
                         print()
-                    val = buf.strip()
-                    if val:
-                        return val
-                    pending = clip_check()
-                    if pending:
-                        out("  (a fresh link was already on the clipboard: id %s)" % pending)
-                        return pending
-                    return None
-                if ch in ("\x00", "\xe0"):        # arrow/function-key prefix
+                        if word in ("o", "l", "r", "s"):
+                            run_mode(db, word)
+                        else:
+                            out('  (unknown input "%s" - modes: O, L, R, S)' % word)
+                            beep()
+                    continue
+                if ch in ("\x00", "\xe0"):
                     if msvcrt.kbhit():
                         msvcrt.getwch()
                     continue
@@ -1598,11 +1959,26 @@ def watch_link_prompt(interval=0.25):
                 if ch.isprintable():
                     buf += ch
                     print(ch, end="", flush=True)
-        pending = clip_check()
-        if pending:
-            out("")
-            out("  (link picked up from the clipboard: id %s)" % pending)
-            return pending
+        changed = False
+        if use_seq:
+            s2 = _clipboard_seq()
+            if s2 != seq:
+                seq = s2
+                changed = True
+        else:
+            t = clipboard_text()
+            if t is not None and t != last_text:
+                last_text = t
+                changed = True
+        if changed:
+            text, html_text, src = read_payload()
+            if process_payload(db, text, html_text, src):
+                continue
+            if text and looks_like_script_json(text):
+                out("  note: scripts are banked via S mode (type S) - this JSON was ignored.")
+
+
+# -------------------------------------------------------- session defaults
 
 
 def load_q_defaults():
@@ -1623,12 +1999,13 @@ def save_q_defaults(quality, scope):
 
 
 def ask_quality_scope_batch():
-    """Q mode: one-time quality + scope for the whole batch (Enter = last used).
-    No probing here - missing renditions fall back automatically at download time."""
+    """ONE-TIME session defaults for NEW EOS teases (Enter = last used).
+    Simple-tease conversions are pinned instead: they use exactly the media
+    their pages reference (tier + used-only); nothing else is assumed."""
     dq, ds = load_q_defaults()
     q_opts = ["xl", "original", "l", "m", "s"]
     out("")
-    out("  quality for this batch (no probing in Q mode - fallbacks cover gaps):")
+    out("  session defaults for NEW EOS teases (simple-tease conversions are pinned):")
     for i, q in enumerate(q_opts, 1):
         out("    %d) %-9s %s" % (i, q, TIER_PIXELS.get(q, "")))
     while True:
@@ -1639,8 +2016,8 @@ def ask_quality_scope_batch():
         if a.isdigit() and 1 <= int(a) <= len(q_opts):
             quality = q_opts[int(a) - 1]
             break
-    out("  scope for this batch:")
-    out("    1) all        - every media file in the script (site default)")
+    out("  scope for new EOS teases:")
+    out("    1) all        - every media file in the script")
     out("    2) used-only  - only what the script references")
     while True:
         a = ask("  scope [%s] (1/2, Enter = keep): " % ds)
@@ -1654,315 +2031,22 @@ def ask_quality_scope_batch():
     return quality, scope
 
 
-def queue_scaffold():
-    """Q mode: copy (or type/paste) tease links - a copied link is picked up
-    from the clipboard automatically; metadata comes from the saved listing
-    pages in downloader/pages/; the script JSON is grabbed straight from the
-    clipboard (open tab -> Ctrl+A, Ctrl+C); folders are scaffolded WITHOUT media
-    - run the R repair afterwards to download everything (browser-free)."""
-    out("")
-    out("=== Q: SCAFFOLD BATCH (metadata from pages/, script from your clipboard) ===")
-    os.makedirs(PAGES, exist_ok=True)
-    n_pages = 0
-    for n in os.listdir(PAGES):
-        if n.lower().endswith((".html", ".htm", ".mhtml", ".mht")):
-            n_pages += 1
-    out("  saved listing pages in pages\\: %d" % n_pages)
-    if not n_pages:
-        out('  -> save a search / author / tag page there first (Ctrl+S ->')
-        out('     "Webpage, Single File (.mhtml)" or "HTML only")')
-    quality, scope = ask_quality_scope_batch()
-    out("")
-    out("  Loop: copy a tease link (auto-picked) -> the JSON tab opens -> Ctrl+A, Ctrl+C ->"
-        " done, it scaffolds the folder (no media yet).")
-    saved = skipped = 0
-    last = clipboard_text()          # ignore whatever is on the clipboard right now
-    index = scan_pages()
-    out("  metadata index: %d tease(s) known from saved pages" % len(index))
-    while True:
-        out("")
-        s = watch_link_prompt()
-        if s is None:
-            break
-        m = re.search(r"id=(\d+)", s)
-        if s.isdigit():
-            tid = s
-        elif m:
-            tid = m.group(1)
-        else:
-            out("  -> not a tease id / link - skipped")
-            skipped += 1
-            continue
-        entry = scan_pages().get(tid)
-        if entry is None:
-            out("  no metadata for %s in pages\\ - save the matching listing page," % tid)
-            out("  then paste this link again (or skip it).")
-            skipped += 1
-            continue
-        existing = find_existing(tid)
-        if existing:
-            out("  already in the library: %s - skipped" % os.path.basename(existing))
-            skipped += 1
-            continue
-        tag_note = ("  [%d tag(s)]" % len(entry["tags"])) if entry["tags"] else ""
-        out('  %s - "%s" by %s%s' % (tid, entry["title"], entry["author"] or "?", tag_note))
-        open_in_browser(SCRIPT_URL.format(id=tid))
-        out("  waiting for the JSON on your clipboard (Ctrl+A, Ctrl+C in that tab)...")
-        text, why = wait_for_tease_json(last)
-        if text is None:
-            out("  no JSON captured (%s) - skipped; paste the link again to retry." % why)
-            skipped += 1
-            continue
-        last = text
-        try:
-            script = json.loads(text.lstrip("\ufeff"))
-        except Exception as e:
-            out("  -> unexpected JSON problem: %s" % e)
-            skipped += 1
-            continue
-        folder = os.path.join(TEASES, sanitize("%s %s" % (tid, entry["title"])))
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, "tease.json"), "w", encoding="utf-8") as f:
-            json.dump(script, f)
-        meta = {"id": int(tid), "title": entry["title"], "author": entry["author"]}
-        if entry["tags"]:
-            meta["tags"] = " ".join(entry["tags"])
-        if entry["desc"]:
-            meta["description"] = clean_line(entry["desc"])
-        with open(os.path.join(folder, "tease-meta.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=1)
-        write_info(os.path.join(folder, "info.txt"), tid, entry["title"], entry["author"],
-                   quality, scope, "SCAFFOLD ONLY (no media yet) - run R to download", None)
-        saved += 1
-        out("  scaffolded: %s  (%d pages / %d files in the script)  [%d this session]" % (
-            os.path.basename(folder), len(script.get("pages") or {}),
-            len(script.get("files") or {}), saved))
-    out("")
-    out("Q done: %d scaffolded, %d skipped. Run R (Auto) to download their media." %
-        (saved, skipped))
-
-
 # ---------------------------------------------------------------- main wizard
 
 
 def main():
     out("=" * 66)
-    out(" Offline tease downloader  (everything stays inside the offline/ folder)")
+    out(" Offline tease downloader - clipboard watch dog (all state stays inside offline/)")
     out("=" * 66)
-
-    # ---------- step 1: tease id / mode ----------
+    quality, scope = ask_quality_scope_batch()
+    db = db_load()
+    n = import_teases(db)
+    db_save(db)
     out("")
-    out("=== Step 1/8: tease id (or mode) ===")
-    while True:
-        s = ask('Tease id, tease LINK, "L" list, "R" repair-all, "O" orphan extract, '
-                '"Q" scaffold batch: ')
-        low = s.lower()
-        if low == "l":
-            list_existing()
-            continue
-        if low == "r":
-            m = ask("  Repair mode: (M)anual (asks for missing tags/description) "
-                    "or (A)uto (no prompts)? ")
-            repair_all(meta_mode="auto" if m.lower().startswith("a") else "manual")
-            return
-        if low == "o":
-            orphan_extract()
-            return
-        if low == "q":
-            queue_scaffold()
-            return
-        m = re.search(r"id=(\d+)", s)
-        if s.isdigit():
-            tease_id = s
-            break
-        if m:
-            tease_id = m.group(1)
-            out("  (tease link recognized: id %s)" % tease_id)
-            break
-        out("  -> a tease id / link, or L, R, O, Q")
-    existing = find_existing(tease_id)
-    prev_quality = None
-    if existing:
-        out("")
-        out('Existing tease found: "%s"   [UPDATE mode]' % os.path.basename(existing))
-        q_prev, s_prev = parse_info(os.path.join(existing, "info.txt"))
-        if q_prev:
-            prev_quality = q_prev
-            out("  (info.txt says: quality=%s, scope=%s - you will re-choose)" %
-                (q_prev, s_prev))
-        if ask('Press Enter to continue (or "x" to abort): ').lower() == "x":
-            return
-
-    # ---------- step 2: script + meta ----------
-    out("")
-    out("=== Step 2/8: script + meta ===")
-    prev_meta = {}
-    if existing:
-        meta_p = os.path.join(existing, "tease-meta.json")
-        if os.path.isfile(meta_p):
-            try:
-                with open(meta_p, encoding="utf-8") as f:
-                    prev_meta = json.load(f)
-            except Exception:
-                pass
-
-    # NEW teases: title/author/tags/description FIRST (paste them from the tease page
-    # you already have open; only the title is required - Enter skips the rest), THEN
-    # the script - the browser opens only for the JSON (one switch total).
-    title = author = tags = description = None
-    if not existing:
-        out("  (paste title + author + optional tags/description from the tease page)")
-        title, author, tags, description = ask_meta(prev_meta)
-
-    script = None
-    reuse = False
-    if existing and os.path.isfile(os.path.join(existing, "tease.json")):
-        ans = ask("Script: (Enter) reuse the existing tease.json / (N) fetch a new one from the browser: ")
-        if ans.lower() != "n":
-            reuse = True
-            with open(os.path.join(existing, "tease.json"), encoding="utf-8") as f:
-                script = json.load(f)
-            out("  -> reusing existing script")
-
-    script_src = None
-    if script is None:
-        hit, extra = find_inbox_script(tease_id)
-        if hit:
-            script_src, script = hit[0], hit[1]
-            out("  -> script found in inbox: %s" % os.path.basename(script_src))
-            note_extras(extra)
-        while script is None:
-            print_script_instructions(tease_id)
-            ans = ask("Press Enter when the file is in the inbox (or paste a full file path): ")
-            if ans:
-                try:
-                    with open(ans.strip('"'), encoding="utf-8-sig") as f:
-                        data = json.load(f)
-                    if isinstance(data.get("pages"), dict) and isinstance(data.get("galleries"), dict):
-                        script, script_src = data, ans.strip('"')
-                        break
-                    out("  -> that file is not a tease script (needs 'pages' + 'galleries')")
-                    continue
-                except Exception as e:
-                    out("  -> cannot read that file: %s" % e)
-                    continue
-            hit, extra = find_inbox_script(tease_id)
-            if hit:
-                script_src, script = hit[0], hit[1]
-                out("  -> found: %s" % os.path.basename(script_src))
-                note_extras(extra)
-                break
-            out("  -> nothing usable found in the inbox yet.")
-            inbox_report()
-
-    # UPDATE teases: meta prompts stay after the script part (previous values kept).
-    if existing:
-        title, author, tags, description = ask_meta(prev_meta)
-
-    # ---------- step 3: reference scan ----------
-    out("")
-    out("=== Step 3/8: reference scan ===")
-    used, all_items, sizes_req = scan_script(script)
-    sum_used = sum(i["size"] for i in used.values())
-    sum_all = sum(i["size"] for i in all_items.values())
-    out("  pages: %d | galleries: %d | files entries: %d" %
-        (len(script.get("pages", {})), len(script.get("galleries", {})), len(script.get("files", {}))))
-    out("  used-only : %d files  (~%s original)" % (len(used), human(sum_used)))
-    out("  all       : %d files  (~%s original)" % (len(all_items), human(sum_all)))
-    if sizes_req:
-        out("  image sizes this tease requests: %s" %
-            ", ".join("%s x%d" % (k, v) for k, v in sorted(sizes_req.items())))
-
-    # ---------- step 4: availability probe ----------
-    out("")
-    out("=== Step 4/8: availability probe (2-3 samples, polite pacing) ===")
-    pool = [h for h, it in (used or all_items).items() if it["ext"] == "jpg"]
-    samples = random.sample(pool, min(3, len(pool))) if pool else []
-    availability = {}
-    ratios = {}
-    if samples:
-        out("  samples: %s" % ", ".join(h[:10] + "..." for h in samples))
-        out("  rendition   " + "  ".join("sample%d" % (i + 1) for i in range(len(samples))))
-        for tier in ["xl", "l", "m", "s"]:
-            statuses, ratio_list = [], []
-            for h in samples:
-                ok, data = fetch_bytes(MEDIA + "tb_%s/%s.jpg" % (tier, h))
-                statuses.append("200" if ok else "404")
-                if ok and all_items.get(h, {}).get("size"):
-                    ratio_list.append(len(data) / float(all_items[h]["size"]))
-            availability[tier] = {"ok_all": all(s == "200" for s in statuses),
-                                  "ok_any": any(s == "200" for s in statuses)}
-            if ratio_list:
-                ratios[tier] = sum(ratio_list) / len(ratio_list)
-            out("  %-10s  %s" % (tier, "   ".join(statuses)))
-        out("  (original is always available - recorded sizes come from the script)")
-    else:
-        out("  (no jpeg images referenced - nothing to probe)")
-
-    # ---------- step 5: quality + scope menu ----------
-    out("")
-    out("=== Step 5/8: quality + scope (explicit choice required) ===")
-    options = [q for q in TIER_ORDER if q == "original" or availability.get(q, {}).get("ok_any")]
-    for i, q in enumerate(options, 1):
-        est_used = sum_used if q == "original" else sum_used * ratios.get(q, 0)
-        est_all = sum_all if q == "original" else sum_all * ratios.get(q, 0)
-        note = ""
-        if q != "original":
-            a = availability.get(q, {})
-            if not a.get("ok_all"):
-                note = "  [PARTIAL - fallback used where missing]"
-        out("  %d) %-9s %-22s est. used-only ~%s | all ~%s%s" %
-            (i, q, TIER_PIXELS[q], human(est_used), human(est_all), note))
-    while True:
-        q = ask("Enter quality number: ")
-        if q.isdigit() and 1 <= int(q) <= len(options):
-            quality = options[int(q) - 1]
-            break
-        out("  -> pick a number from the list")
-    out("")
-    out("  scope options:")
-    out("   1) used-only  - %d files (only what the script references)" % len(used))
-    out("   2) all        - %d files (includes %d never-referenced)" %
-        (len(all_items), len(all_items) - len(used)))
-    while True:
-        s = ask("Enter scope number: ")
-        if s in ("1", "2"):
-            scope = "used-only" if s == "1" else "all"
-            break
-        out("  -> 1 or 2")
-    items = used if scope == "used-only" else all_items
-
-    # ---------- steps 6-8: layout, verify, download, finalize (shared pipeline) ----------
-    folder = existing or os.path.join(TEASES, sanitize("%s %s" % (tease_id, title)))
-    os.makedirs(os.path.join(folder, "timg"), exist_ok=True)
-    if not reuse and script_src:
-        shutil.move(script_src, os.path.join(folder, "tease.json"))
-    elif not os.path.isfile(os.path.join(folder, "tease.json")):
-        with open(os.path.join(folder, "tease.json"), "w", encoding="utf-8") as f:
-            json.dump(script, f)
-    meta_out = dict(prev_meta) if existing else {}   # updates keep unknown keys
-    meta_out["id"] = int(tease_id)
-    meta_out["title"] = title
-    meta_out["author"] = author
-    if tags is not None:            # None = user skipped -> key stays missing
-        meta_out["tags"] = tags
-    if description is not None:
-        meta_out["description"] = description
-    with open(os.path.join(folder, "tease-meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta_out, f, indent=1)
-
-    stats = run_pipeline(folder, script, tease_id, title, author, quality, scope,
-                         prev_quality=prev_quality, interactive=True)
-    out("")
-    if stats["bad"] == 0:
-        out("DONE. %d/%d files verified (%s).%s" %
-            (stats["ok"], stats["total"], human(stats["bytes"]),
-             (" (%d known-unavailable - see unavailable.txt)" % stats["gone"])
-             if stats.get("gone") else ""))
-        out('Start "start-server.bat" -> the landing page lists the tease -> play.')
-    else:
-        out("PARTIAL: %d file(s) missing/bad - rerun this tool to retry." % stats["bad"])
-    out("(Rerun any time to update or repair this tease.)")
+    out("  knowledge DB: %d tease(s) known (%d tease folder(s) imported from teases\\)."
+        % (len(db["teases"]), n))
+    out("  session defaults for new EOS teases: quality=%s, scope=%s" % (quality, scope))
+    main_loop(db)
 
 
 if __name__ == "__main__":
@@ -1970,8 +2054,10 @@ if __name__ == "__main__":
         main()
     except (KeyboardInterrupt, EOFError):
         out("")
-        out("Aborted by user - finished files are kept; rerun to resume.")
+        out("Closed by user - everything is saved.")
     except Exception as e:
         out("")
         out("Unexpected error: %r" % e)
+        import traceback
+        traceback.print_exc()
         out("Nothing outside the offline/ folder was touched.")

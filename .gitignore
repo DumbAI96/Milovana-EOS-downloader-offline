@@ -6,14 +6,8 @@ teases/
 __pycache__/
 *.pyc
 
-# inbox: keep the placeholder README, ignore everything else
-downloader/incoming/*
-!downloader/incoming/README.txt
-
-# Q mode: saved listing pages (your copies) + remembered batch defaults
-# (pages/: keep the placeholder README, ignore everything else)
-downloader/pages/*
-!downloader/pages/README.txt
+# the downloader's own state (local only)
+downloader/knowledge.json
 downloader/q_defaults.json
 
 # --- third-party files (fetched by each user, not distributed here) ---

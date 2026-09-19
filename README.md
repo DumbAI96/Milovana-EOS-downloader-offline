@@ -112,31 +112,39 @@ Settings persist in `state\global\settings.json` (files, not the browser).
 
 ### Downloader (`downloader/`)
 
-- Console wizard; everything it touches stays inside this folder (own venv + `incoming\` script inbox + `pages\` for saved listing pages).
-- **Browser-assist** for script fetching: Cloudflare-protected pages are opened in *your* browser —
-  the tool itself never bypasses challenges.
-- The inbox accepts **any** file name/extension — the content decides; unusable files are listed
-  with reasons (e.g. a saved Cloudflare page is detected).
-- Availability probe + **quality/scope menu** with real size estimates (an explicit choice is
-  required every run — no defaults).
-- Downloads are **paced, resumable** (`.part` + atomic rename) and **byte-size verified** against the
-  script; per-file quality fallback where a rendition is missing; failures are retried on rerun.
-- **`Q` — batch scaffolding**: copy tease links one by one — a copied link is **picked up from the
-  clipboard automatically** (typing/pasting in the console still works; Enter on an empty line
-  leaves Q). Metadata comes from the listing pages saved in `downloader\pages\`, the script JSON is
-  taken from your clipboard (no Save dialogs), and the tease folder is laid out *without media* —
-  run `R` (Auto) afterwards to download everything browser-free. Details under "Downloading teases
-  (the wizard)".
-- Rerunning with the same id = **update/repair**; `R` at the first prompt = **repair ALL teases**
-  (it first asks **(M)anual** — asks for missing tags/description as it passes each tease — or
-  **(A)uto** — zero prompts, ideal after a `Q` batch); `O` = orphan extractor (below).
-- **Metadata per tease**: title/author + optional `tags` + `description` (asked at download time,
-  fillable later via `R`; Enter skips — a skipped field is asked again next time). Tags are
-  space-separated single words (use hyphens for compounds, e.g. `female-top`).
-- Files the site no longer serves are listed per tease in `unavailable.txt` and skipped by repairs —
+- **A clipboard watch dog** — no file juggling, no Save dialogs. It watches your clipboard; every
+  page you copy is classified and filed:
+  - **listing page** (search / author / tag) → its meta pairs (title/author/tags/description) go
+    into the **knowledge DB** (`downloader\knowledge.json`) — including each teasе's **type**
+    (a Flash/EOS picto-tag on the box = interactive "player"; no picto = simple "static"; TOTM is
+    just an award and is ignored)
+  - **simple-tease page** → stored per page; that teasе is created/extended instantly (copy pages
+    in any order, any subset — later copies merge)
+  - **player page** (EOS / flash-converted / NyX — verified: they all share the same player
+    frame) → a **stub** (wanted; id/title/author taken straight from the page)
+  - **naked teasе link** → a **stub** too (queue whole author pages by copying links) — but only
+    when title+author are already known (copy the listing first; keyless links are skipped)
+  - everything else (screenshots, text…) → ignored
+- **`S` mode — type-aware collector:** walks the wanted stubs one at a time: **player** stubs
+  open their `geteosscript` link (you copy the JSON; Ctrl+A, Ctrl+C; no timeout; Enter skips), **static** stubs just open their first page (copy pages whenever), and **type-unknown** stubs
+  open the teasе page first — one copy tells the tool which one it is and the right flow continues
+  automatically (rarely needed now: listings already carry the type). Every teasе in the DB
+  carries its **type** (static / player).
+- **`R` — repair-all, zero prompts:** refreshes every teasе's meta from the DB, then verifies and
+  downloads every file using each teasе's recorded quality+scope (simple conversions are pinned to
+  the media their pages use — nothing else is ever assumed). **Browser-free.**
+- **`O`** — extract ORPHANED leftovers (see below). **`L`** — list the library.
+- Placeholders (`Unknown` / `no-tags` / `no-description`) fill unknown fields — **but a teasе
+  folder is only ever created once title+author are known** (no more "Unknown" folders; stale
+  folder names are renamed automatically when titles change, and launch warns about duplicate-id
+  folders). Tags are space-separated single words (hyphens for compounds, e.g. `female-top`).
+- **Site-markup parsers live in `downloader\parsers.py`** — the one patch point when the site
+  changes.
+- Warning beeps (Windows) on unexpected content, failed parses, skipped ids and R failures.
+- Files the site no longer serves are listed per teasе in `unavailable.txt` and skipped by repairs —
   delete a line to retry it.
 
-### Orphan extractor (`O` at the first prompt)
+### Orphan extractor (`O` mode)
 
 - Pure-local analysis (no network): finds pages the script's flow can't reach + media nothing
   references.
@@ -170,47 +178,43 @@ player\
     PATCHES.txt         exact patch instructions for the official player files
 downloader\
     downloader.py       the whole tool (stdlib only)
-    incoming\
-        README.txt        inbox for browser-fetched scripts
-    pages\
-        README.txt        saved listing pages (Q mode metadata)
+    parsers.py          site page parsers (the patch point for markup changes)
 ```
+
+(`downloader\knowledge.json` — the meta/page/stub database — appears here at first run.)
 
 **Not in the repo (by design):** the official player files (`player.html`, `acorn-safe.min.js`,
 `interpreter.min.js`, `eos.load.css`, `eos_throbber.gif`, `player\assets\**` — bundle, chunks, css,
 fonts, images). Fetch them with the [How to DIY](#how-to-diy-assembling-the-player-files) steps.
 Also excluded: `teases\` and `state\` (your data; created automatically on first use).
 
-## Downloading teases (the wizard)
+## Using the downloader (clipboard watch dog)
 
-Double-click **`start-downloader.bat`**. The first prompt takes a **tease id**, a full
-**tease link** (the id is extracted), or a mode letter:
+Double-click **`start-downloader.bat`**. You answer exactly one thing: the **session defaults**
+(quality + scope for NEW EOS teases; Enter keeps the last used). Then the watch dog runs until you
+close the window — **copying pages is the whole interface**. (Chrome/Edge: the clipboard's hidden
+HTML flavor carries the page's own address, which is how ids and page numbers arrive.)
 
-- **`Q` — scaffold batch (fast, no media):** set quality + scope **once** (Enter = last used; no
-  probing — fallbacks cover gaps), then **copy tease links** one by one — a copied link is picked up
-  from the clipboard automatically (250 ms polling; typing/pasting still works; Enter on an empty
-  line leaves Q). For each link the tool reads
-  **title / author / description / tags** from the listing pages you saved in `downloader\pages\`
-  (search / author / tag pages; Ctrl+S as `.mhtml` or HTML — re-save any time, it re-scans per
-  link), opens the script JSON in your browser, and grabs it **straight from your clipboard**
-  (Ctrl+A, Ctrl+C — no Save dialog; a stale clipboard copy is never matched). It writes
-  `tease.json` + `tease-meta.json` (fully filled!) + `info.txt` and moves to the next link. Links
-  not found in your saved pages — or already in the library — are warned + skipped without opening
-  anything. After the batch: run `R`.
-- **`O`** — extract ORPHANED leftovers (see Features above).
-- **`R`** — REPAIR ALL teases at once: it asks **(M)anual** (asks for missing tags/description as it
-  passes each tease; Enter skips — asked again next run) or **(A)uto** (zero prompts — the one to
-  use after a `Q` batch). Re-verifies everything using each tease's recorded quality+scope and
-  refetches missing/broken files (+ all media for freshly scaffolded teases) — fully browser-free.
-- **A tease id or link — normal single-tease flow:** paste title/author + optional tags/description
-  (from the tease page you already have open; Enter skips the optional ones) → the script link opens
-  in your browser automatically; `Ctrl+S` it into `downloader\incoming\` (ANY file name works —
-  content decides; if the browser saved a Cloudflare check page instead, the tool says so) →
-  quality + scope menu (probes which tiers exist, real size estimates) → download with
-  pacing/resume/verification into a server-ready folder.
+- **Listing pages** (search / author / tag) → meta pairs for every teasе on the page go into the
+  knowledge DB. Preload a few hundred any time — this is the bulk metadata move.
+- **Simple-tease pages** (classic page-style, e.g. *The Blue Balls Edging Challenge*) → each copy
+  updates that teasе instantly: the first page creates it, later pages extend it — any order, any
+  subset, END page included or not. Missing pages are reported; every later copy merges.
+- **Player pages** (EOS / flash-converted / NyX) → a **stub** ("wanted", type = player; its
+  title+author are read straight from the page's header). Nothing opens — banking happens in `S` mode.
+- **Naked teasе links** (right-click → Copy link address on any teasе title) → a stub too — if
+  title+author are known (copy the listing page first). One author page = a dozen teases queued in
+  seconds, without loading a single teasе page.
+- **`S` mode** → type-aware: **player** stubs open their `geteosscript` link (you copy the JSON as
+  the tab opens; no timeout; Enter skips); **static** stubs just open their first page as a bookmark
+  (copy pages whenever); **unknown** stubs open the teasе page first — copy it once and the tool
+  knows what it is (static page stored / JSON link opened next). Copied pages/listing are absorbed
+  mid-run without breaking it.
+- **`R`** → refresh + download everything (zero prompts). **`O`** → orphan extractor. **`L`** → list.
 
-Rerun with the same id = update/repair (all options re-asked; on a quality change it asks whether to
-remove old files).
+Beeps tell you when something unexpected happened (a page that didn't parse, a skipped id, R
+failures); normal progress is silent. Exit by closing the window or Ctrl+C — everything is saved as
+you go.
 
 Pacing: `DOWNLOAD_RATE` in `start-downloader.bat` (files per second).
 
@@ -315,10 +319,7 @@ offline\
 │       └── noto-sans-*.woff/.woff2  (fetched, ×8)
 └── downloader\
     ├── downloader.py
-    ├── incoming\
-    │   └── README.txt
-    ├── pages\
-    │   └── README.txt
+    ├── parsers.py                   (site page parsers - the markup patch point)
     └── venv\                        (auto-created on first run)
 ```
 
