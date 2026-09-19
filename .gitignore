@@ -10,6 +10,12 @@ __pycache__/
 downloader/incoming/*
 !downloader/incoming/README.txt
 
+# Q mode: saved listing pages (your copies) + remembered batch defaults
+# (pages/: keep the placeholder README, ignore everything else)
+downloader/pages/*
+!downloader/pages/README.txt
+downloader/q_defaults.json
+
 # --- third-party files (fetched by each user, not distributed here) ---
 # see README.md -> "How to DIY (assembling the player files)"
 player/player.html

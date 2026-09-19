@@ -112,7 +112,7 @@ Settings persist in `state\global\settings.json` (files, not the browser).
 
 ### Downloader (`downloader/`)
 
-- Console wizard; everything it touches stays inside this folder (own venv + `incoming\` inbox).
+- Console wizard; everything it touches stays inside this folder (own venv + `incoming\` script inbox + `pages\` for saved listing pages).
 - **Browser-assist** for script fetching: Cloudflare-protected pages are opened in *your* browser —
   the tool itself never bypasses challenges.
 - The inbox accepts **any** file name/extension — the content decides; unusable files are listed
@@ -121,9 +121,15 @@ Settings persist in `state\global\settings.json` (files, not the browser).
   required every run — no defaults).
 - Downloads are **paced, resumable** (`.part` + atomic rename) and **byte-size verified** against the
   script; per-file quality fallback where a rendition is missing; failures are retried on rerun.
+- **`Q` — batch scaffolding**: copy tease links one by one — a copied link is **picked up from the
+  clipboard automatically** (typing/pasting in the console still works; Enter on an empty line
+  leaves Q). Metadata comes from the listing pages saved in `downloader\pages\`, the script JSON is
+  taken from your clipboard (no Save dialogs), and the tease folder is laid out *without media* —
+  run `R` (Auto) afterwards to download everything browser-free. Details under "Downloading teases
+  (the wizard)".
 - Rerunning with the same id = **update/repair**; `R` at the first prompt = **repair ALL teases**
-  (also asks for any missing tags/description as it passes each tease); `O` = orphan extractor
-  (below).
+  (it first asks **(M)anual** — asks for missing tags/description as it passes each tease — or
+  **(A)uto** — zero prompts, ideal after a `Q` batch); `O` = orphan extractor (below).
 - **Metadata per tease**: title/author + optional `tags` + `description` (asked at download time,
   fillable later via `R`; Enter skips — a skipped field is asked again next time). Tags are
   space-separated single words (use hyphens for compounds, e.g. `female-top`).
@@ -166,6 +172,8 @@ downloader\
     downloader.py       the whole tool (stdlib only)
     incoming\
         README.txt        inbox for browser-fetched scripts
+    pages\
+        README.txt        saved listing pages (Q mode metadata)
 ```
 
 **Not in the repo (by design):** the official player files (`player.html`, `acorn-safe.min.js`,
@@ -175,18 +183,31 @@ Also excluded: `teases\` and `state\` (your data; created automatically on first
 
 ## Downloading teases (the wizard)
 
-Double-click **`start-downloader.bat`** and follow the wizard:
+Double-click **`start-downloader.bat`**. The first prompt takes a **tease id**, a full
+**tease link** (the id is extracted), or a mode letter:
 
-- **`O`** at the first prompt — extract ORPHANED leftovers (see Features above).
-- **`R`** at the first prompt — REPAIR ALL teases at once: re-verifies everything using each tease's
-  recorded quality+scope and refetches missing/broken files; asks for any missing tags/description
-  as it passes each tease (Enter skips — asked again next run).
-- **New tease** — enter the id → paste title/author + optional tags/description (from the tease page
-  you already have open; Enter skips the optional ones) → the script link opens in your browser
-  automatically; `Ctrl+S` it into `downloader\incoming\` (ANY file name works — content decides; if
-  the browser saved a Cloudflare check page instead, the tool says so) → quality + scope menu (probes
-  which tiers exist, real size estimates) → download with pacing/resume/verification into a
-  server-ready folder.
+- **`Q` — scaffold batch (fast, no media):** set quality + scope **once** (Enter = last used; no
+  probing — fallbacks cover gaps), then **copy tease links** one by one — a copied link is picked up
+  from the clipboard automatically (250 ms polling; typing/pasting still works; Enter on an empty
+  line leaves Q). For each link the tool reads
+  **title / author / description / tags** from the listing pages you saved in `downloader\pages\`
+  (search / author / tag pages; Ctrl+S as `.mhtml` or HTML — re-save any time, it re-scans per
+  link), opens the script JSON in your browser, and grabs it **straight from your clipboard**
+  (Ctrl+A, Ctrl+C — no Save dialog; a stale clipboard copy is never matched). It writes
+  `tease.json` + `tease-meta.json` (fully filled!) + `info.txt` and moves to the next link. Links
+  not found in your saved pages — or already in the library — are warned + skipped without opening
+  anything. After the batch: run `R`.
+- **`O`** — extract ORPHANED leftovers (see Features above).
+- **`R`** — REPAIR ALL teases at once: it asks **(M)anual** (asks for missing tags/description as it
+  passes each tease; Enter skips — asked again next run) or **(A)uto** (zero prompts — the one to
+  use after a `Q` batch). Re-verifies everything using each tease's recorded quality+scope and
+  refetches missing/broken files (+ all media for freshly scaffolded teases) — fully browser-free.
+- **A tease id or link — normal single-tease flow:** paste title/author + optional tags/description
+  (from the tease page you already have open; Enter skips the optional ones) → the script link opens
+  in your browser automatically; `Ctrl+S` it into `downloader\incoming\` (ANY file name works —
+  content decides; if the browser saved a Cloudflare check page instead, the tool says so) →
+  quality + scope menu (probes which tiers exist, real size estimates) → download with
+  pacing/resume/verification into a server-ready folder.
 
 Rerun with the same id = update/repair (all options re-asked; on a quality change it asks whether to
 remove old files).
@@ -294,9 +315,11 @@ offline\
 │       └── noto-sans-*.woff/.woff2  (fetched, ×8)
 └── downloader\
     ├── downloader.py
-    ├── venv\                        (auto-created on first run)
-    └── incoming\
-        └── README.txt
+    ├── incoming\
+    │   └── README.txt
+    ├── pages\
+    │   └── README.txt
+    └── venv\                        (auto-created on first run)
 ```
 
 `teases\` and `state\` are created automatically when you first download / play something.
