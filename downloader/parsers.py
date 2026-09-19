@@ -12,11 +12,20 @@
 #    player   -> a script-based tease page (EOS / flash-converted / NyX -
 #                all play in the same player; verified marker: "eosIframe")
 #    link     -> a naked copied tease url (plain text: showtease.php?id=N)
+#    shell    -> the PLAYER'S OWN page: you clicked inside the tease, so the
+#                copy is eosscript's document - title/author live in its top
+#                bar (_tease_ / _authorButton_), the Milovana id never does
+#    address  -> an EMPTY parent-page copy (Ctrl+A without clicking): a player
+#                tease's page is one big iframe, so only the id in the address
+#                survives; empty copy + showtease address = interactive tease
 #
 #  Verified against real samples (2026-09-19): listings carry Flash/EOS
 #  picto-tags on interactive teases (TOTM = Tease of the Month award, ignored)
 #  -> parse_listing derives each entry's type from them; every interactive kind
 #  embeds the same "eosIframe" player frame -> parse_player_page anchors there.
+#  Clipboard probes (2026-09-19, live pages): a fresh Ctrl+A copy of a player
+#  page = EMPTY fragment + the id in the address; a copy made after clicking
+#  = the player shell (top bar keeps title/author, running or not).
 # ============================================================================
 
 import re
@@ -333,12 +342,64 @@ def parse_player_page(html_text, source_url):
     return {"id": str(did), "title": title, "author": author}, None
 
 
+def _is_empty_copy(html_text):
+    """True when the fragment is just Chrome's trailing marker - i.e. Ctrl+A
+    copied nothing. Normal for an iframe-only page: the id still arrives in
+    the clipboard's address (SourceURL)."""
+    t = (html_text or "").replace('<br class="Apple-interchange-newline">', "")
+    return not t.strip()
+
+
+def parse_player_shell(html_text, source_url):
+    """The PLAYER'S OWN document (you clicked inside the tease, then copied).
+    Ctrl+A then selects the eosscript iframe's content, so there is NO Milovana
+    id anywhere - but the player's top bar always carries the tease's real
+    title + author (running or not). Verified on live clipboard probes.
+    Returns ({'title','author'}, None) or (None, reason)."""
+    src = source_url or ""
+    if "eosscript.com" not in src and "_authorButton_" not in (html_text or ""):
+        return None, "not a player-shell copy"
+
+    def grab(pattern):
+        m = re.search(pattern, html_text)
+        return strip_tags(m.group(1)).strip() if m else ""
+
+    title = grab(r'class="_tease_[^"]*"[^>]*>([^<]+)<')            # top bar
+    author = grab(r'class="_authorButton_[^"]*"[^>]*>([^<]+)<')   # top bar
+    if not title:
+        title = grab(r"<h1[^>]*>(.+?)</h1>")                      # start screen
+    if not author:
+        author = grab(r"(?is)<h2[^>]*>\s*by\s+(.+?)</h2>")        # start screen
+    if not title or not author:
+        return None, "no title/author in the player shell"
+    return {"title": title, "author": author}, None
+
+
+def parse_address_copy(html_text, source_url):
+    """An EMPTY Ctrl+A copy whose address is a showtease page: only the id
+    survived. That is the normal parent-page copy for player teases (their
+    page is a single iframe - nothing else copies); static pages copy WITH
+    content, so "empty + showtease address" doubles as a player-type hint.
+    Returns ({'id': ...}, None) or (None, reason)."""
+    tid = tease_id_from_url(source_url)
+    if not tid:
+        return None, "no tease id in the page address"
+    if not _is_empty_copy(html_text):
+        return None, "copy is not empty"
+    return {"id": tid}, None
+
+
 def classify_page(html_text, source_url):
     """A copied page -> payload dict (or None when unrecognized):
        {'kind':'listing','entries':[...]}
        {'kind':'simple','page':{...}}
-       {'kind':'player','id':...,'title':...}"""
+       {'kind':'player','id':...,'title':...,'author':...}  (parent page, markers survived)
+       {'kind':'player_shell','title':...,'author':...}     (copy made inside the player)
+       {'kind':'address','id':...}                          (empty parent copy: id only)"""
     if not html_text:
+        addr, _reason = parse_address_copy(html_text, source_url)
+        if addr:
+            return {"kind": "address", "id": addr["id"]}
         return None
     entries = parse_listing(html_text)
     if entries:
@@ -351,4 +412,10 @@ def classify_page(html_text, source_url):
         if pg:
             return {"kind": "player", "id": pg["id"], "title": pg.get("title", ""),
                     "author": pg.get("author", "")}
+    shell, _r3 = parse_player_shell(html_text, source_url)
+    if shell:
+        return {"kind": "player_shell", "title": shell["title"], "author": shell["author"]}
+    addr, _r4 = parse_address_copy(html_text, source_url)
+    if addr:
+        return {"kind": "address", "id": addr["id"]}
     return None

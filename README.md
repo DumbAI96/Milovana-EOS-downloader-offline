@@ -200,15 +200,20 @@ HTML flavor carries the page's own address, which is how ids and page numbers ar
 - **Simple-tease pages** (classic page-style, e.g. *The Blue Balls Edging Challenge*) → each copy
   updates that teasе instantly: the first page creates it, later pages extend it — any order, any
   subset, END page included or not. Missing pages are reported; every later copy merges.
-- **Player pages** (EOS / flash-converted / NyX) → a **stub** ("wanted", type = player; its
-  title+author are read straight from the page's header). Nothing opens — banking happens in `S` mode.
+- **Player teases copy in two halves** (normal — their page is one big iframe): a fresh copy
+  *without clicking* comes out **empty** and carries only the **id** (from the page's address);
+  a copy *after clicking inside* lands in the player itself and carries its **title + author**
+  (the player's top bar — it stays there while the tease runs). The tool binds the two together
+  (DB match, or the address copy you just made) → stub queued ("wanted", player).
+  Nothing opens here — banking happens in `S` mode.
 - **Naked teasе links** (right-click → Copy link address on any teasе title) → a stub too — if
   title+author are known (copy the listing page first). One author page = a dozen teases queued in
   seconds, without loading a single teasе page.
 - **`S` mode** → type-aware: **player** stubs open their `geteosscript` link (you copy the JSON as
   the tab opens; no timeout; Enter skips); **static** stubs just open their first page as a bookmark
   (copy pages whenever); **unknown** stubs open the teasе page first — copy it once and the tool
-  knows what it is (static page stored / JSON link opened next). Copied pages/listing are absorbed
+  knows what it is (a page with content = static; an EMPTY copy = player, and its JSON link opens
+  next). Copied pages/listing are absorbed
   mid-run without breaking it.
 - **`R`** → refresh + download everything (zero prompts). **`O`** → orphan extractor. **`L`** → list.
 

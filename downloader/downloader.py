@@ -1254,6 +1254,10 @@ def beep():
 # ------------------------------------------------------------- knowledge DB
 
 
+LAST_SIGHTING = None   # last id learned from an EMPTY page copy (id-only); a
+                       # follow-up player-shell copy binds its title/author here
+
+
 def db_load():
     try:
         with open(DB_PATH, encoding="utf-8") as f:
@@ -1679,6 +1683,71 @@ def handle_link(db, tid):
     out('  link \u2192 stub: %s  (queued - S mode banks it later)' % _label(db, tid))
 
 
+def _resolve_shell_id(db, title, author):
+    """A player-shell copy carries title+author but no id (the copy is the
+    eosscript player's own document). Bind it:
+      1. exact (title, author) match in the DB - the normal way (listings)
+      2. else the most recent EMPTY-page (address) sighting that still lacks
+         title/author - the "copy the page, play, copy again" flow
+    Returns the bound id or None."""
+    tl = (title or "").strip().lower()
+    al = (author or "").strip().lower()
+    hits = [k for k, e in db["teases"].items()
+            if str(e.get("title") or "").strip().lower() == tl
+            and str(e.get("author") or "").strip().lower() == al]
+    if hits:
+        if LAST_SIGHTING in hits:
+            return LAST_SIGHTING
+        return hits[0]
+    if LAST_SIGHTING:
+        e = db["teases"].get(LAST_SIGHTING)
+        if e is not None and not _has_keys(e):
+            return LAST_SIGHTING
+    return None
+
+
+def handle_player_shell(db, title, author):
+    """A copy made INSIDE the player (clicked the tease, then Ctrl+A+C): it
+    carries the real title+author in the player's top bar, but never the id.
+    Resolve the id, then treat it exactly like a player page - same stub rules.
+    Returns the bound id (or None when it cannot be bound)."""
+    if not title or not author:
+        beep()
+        out("  player copy: could not read title/author from it - skipped")
+        out("    (keep that copy - it is a parser patch sample!)")
+        return None
+    tid = _resolve_shell_id(db, title, author)
+    if tid is None:
+        beep()
+        out('  player copy: "%s" by %s - no id known for it yet' % (title, author))
+        out("    copy its page first (fresh load, NO click, Ctrl+A+C), then this copy again")
+        return None
+    handle_player(db, tid, title, author)
+    return tid
+
+
+def handle_address(db, tid):
+    """An EMPTY copy of a showtease page: only the id survived (normal for
+    player teases - their page is one big iframe). Remember it as the last
+    sighting (a player-shell copy can bind to it), and when nothing better is
+    known take "empty parent copy" as the player hint (static pages copy WITH
+    content; listings stay authoritative and overwrite this)."""
+    global LAST_SIGHTING
+    LAST_SIGHTING = str(tid)
+    e = db_entry(db, tid)
+    if e.get("has_script") or e.get("pages"):
+        out('  page address: %s  (already have its data - nothing queued)' % _label(db, tid))
+        return
+    if e.get("type") == "static":
+        out('  page address: %s  (static tease - copy its pages as usual)' % _label(db, tid))
+        return
+    hint = ""
+    if not e.get("type"):
+        e["assumed"] = "player"     # iframe-only page => interactive tease
+        hint = " - iframe-only page, assumed player"
+    out('  page address \u2192 %s  (id noted%s)' % (_label(db, tid), hint))
+
+
 def looks_like_script_json(txt):
     """A valid EOS script copy: JSON with a non-empty 'pages' dict."""
     if not txt:
@@ -1696,8 +1765,8 @@ def looks_like_script_json(txt):
 def process_payload(db, text, page_html, source_url):
     """Handle one clipboard payload by its kind. Returns a small dict describing
     what was handled ({'kind', 'id'}) - or None for unrelated junk (silent)."""
-    if page_html:
-        what = parsers.classify_page(page_html, source_url)
+    if page_html is not None or source_url:
+        what = parsers.classify_page(page_html or "", source_url)
         if what is None:
             if source_url and "milovana.com" in source_url:
                 beep()
@@ -1716,6 +1785,14 @@ def process_payload(db, text, page_html, source_url):
             handle_player(db, what["id"], what.get("title", ""), what.get("author", ""))
             db_save(db)
             return {"kind": "player", "id": str(what["id"])}
+        if what["kind"] == "player_shell":
+            tid = handle_player_shell(db, what.get("title", ""), what.get("author", ""))
+            db_save(db)
+            return {"kind": "player_shell", "id": (str(tid) if tid else None)}
+        if what["kind"] == "address":
+            handle_address(db, what["id"])
+            db_save(db)
+            return {"kind": "address", "id": str(what["id"])}
     if text:
         tid = parsers.tease_id_from_link(text)
         if tid:
@@ -1752,6 +1829,7 @@ def mode_grab_scripts(db):
     out("  S MODE - %d wanted stub(s), one at a time (Enter = skip the current one):" % len(ids))
     out("    player teases -> geteosscript link opens; copy that JSON (Ctrl+A, Ctrl+C)")
     out("    unknown       -> the tease page opens first; copy it so I can tell what it is")
+    out("    (player pages are one big iframe: an EMPTY copy of them is normal - the id comes from the address)")
     out("    static        -> its first page just opens (copy its pages whenever)")
     _OPENED_URLS.clear()
     banked = skipped = 0
@@ -1872,7 +1950,8 @@ def mode_grab_scripts(db):
             if info and info.get("kind") == "simple" and info.get("id") == tid:
                 out("    that was page 1 of a static tease - stored; more pages merge as you copy them.")
                 outcome = "next"
-            elif info and info.get("kind") == "player" and info.get("id") == tid and phase == "learn":
+            elif (info and info.get("kind") in ("player", "player_shell", "address")
+                  and info.get("id") == tid and phase == "learn"):
                 out("    it is a player tease! opening its geteosscript link now...")
                 open_in_browser(SCRIPT_URL.format(id=tid))
                 out('    waiting for the script - Ctrl+A, Ctrl+C in the tab that opened. (Enter = skip)')
